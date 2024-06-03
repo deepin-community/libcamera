@@ -2,7 +2,7 @@
 /*
  * Copyright (C) 2022, Google Inc.
  *
- * yaml_parser.cpp - libcamera YAML parsing helper
+ * libcamera YAML parsing helper
  */
 
 #include "libcamera/internal/yaml_parser.h"
@@ -676,7 +676,7 @@ int YamlParserContext::parseDictionaryOrList(YamlObject::Type type,
 	 * Add a safety counter to make sure we don't loop indefinitely in case
 	 * the YAML file is malformed.
 	 */
-	for (unsigned int sentinel = 1000; sentinel; sentinel--) {
+	for (unsigned int sentinel = 2000; sentinel; sentinel--) {
 		auto evt = nextEvent();
 		if (!evt)
 			return -EINVAL;

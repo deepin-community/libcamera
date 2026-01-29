@@ -8,9 +8,6 @@ Section: libs
 Priority: optional
 Build-Depends: debhelper-compat (= 13),
                dh-sequence-python3,
-               doxygen <!nodoc>,
-               doxygen-latex [!sh4] <!nodoc> | texlive-latex-extra <!nodoc>,
-               graphviz <!nodoc>,
                libdrm-dev <!pkg.libcamera.nosdl>,
                libdw-dev <!pkg.libcamera.notrace>,
                libevent-dev,
@@ -19,25 +16,32 @@ Build-Depends: debhelper-compat (= 13),
                libgstreamer1.0-dev,
                libgtest-dev <!nocheck>,
                libjpeg-dev <!pkg.libcamera.nosdl>,
-               libjs-jquery <!nodoc>,
-               libjs-sphinxdoc <!nodoc>,
-               libjs-underscore <!nodoc>,
                liblttng-ust-dev [!hurd-any !i386],
+               libpisp-dev [arm64 armel armhf],
                libpython3-dev <!pkg.libcamera.nopython>,
                libsdl2-dev <!pkg.libcamera.nosdl>,
                libtiff-dev,
                libudev-dev [linux-any],
                libyaml-dev,
-               meson (>= 0.60),
+               libyuv-dev,
+               meson (>= 0.63),
                openssl,
                pkgconf,
-               python3-jinja2,
+               python3-jinja2:native,
                python3-ply,
                python3-pybind11 <!pkg.libcamera.nopython>,
-               python3-sphinx <!nodoc>,
-               python3-yaml,
-               qtbase5-dev <!pkg.libcamera.noqt>
-Standards-Version: 4.7.0
+               python3-yaml:native,
+               qt6-base-dev [!i386] <!pkg.libcamera.noqt>
+Build-Depends-Indep: doxygen <!nodoc>,
+                     doxygen-latex <!nodoc>,
+                     graphviz <!nodoc>,
+                     libjs-jquery <!nodoc>,
+                     libjs-sphinxdoc <!nodoc>,
+                     libjs-underscore <!nodoc>,
+                     python3-sphinx:native <!nodoc>,
+                     python3-sphinx-book-theme:native <!nodoc>,
+                     python3-sphinxcontrib.doxylink:native <!nodoc>
+Standards-Version: 4.7.2
 Vcs-Browser: https://salsa.debian.org/multimedia-team/libcamera
 Vcs-Git: https://salsa.debian.org/multimedia-team/libcamera.git
 Homepage: https://libcamera.org/
@@ -46,7 +50,7 @@ Rules-Requires-Root: no
 Package: libcamera-dev
 Architecture: linux-any
 Section: libdevel
-Depends: libcamera0.3 (= ${binary:Version}),
+Depends: libcamera0.6 (= ${binary:Version}),
          ${misc:Depends},
          ${shlibs:Depends}
 Description: complex camera support library (development files)
@@ -74,7 +78,7 @@ Description: complex camera support library (documentation)
  This package contains the documentation developing with libcamera.
 Build-Profiles: <!nodoc>
 
-Package: libcamera0.3
+Package: libcamera0.6
 Architecture: linux-any
 Multi-Arch: same
 Depends: ${misc:Depends},
@@ -107,7 +111,8 @@ Architecture: linux-any
 Multi-Arch: foreign
 Section: video
 Depends: ${misc:Depends},
-         ${shlibs:Depends}
+         ${shlibs:Depends},
+         libcamera-v4l2 (= ${binary:Version})
 Pre-Depends: ${misc:Pre-Depends}
 Description: complex camera support library (tools)
  libcamera is a complex camera support library which handles low-level
@@ -146,7 +151,6 @@ Description: complex camera support library (GStreamer plugin)
 
 Package: python3-libcamera
 Architecture: linux-any
-Multi-Arch: same
 Section: python
 Depends: ${misc:Depends},
          ${python3:Depends},

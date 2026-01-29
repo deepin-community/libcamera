@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 /*
- * Copyright (C) 2023, Red Hat Inc.
+ * Copyright (C) 2023-2025 Red Hat Inc.
  *
  * Authors:
  * Hans de Goede <hdegoede@redhat.com>
@@ -10,20 +10,45 @@
 
 #pragma once
 
+#include <array>
+#include <stdint.h>
+
 namespace libcamera {
 
 struct DebayerParams {
-	static constexpr unsigned int kGain10 = 256;
+	static constexpr unsigned int kRGBLookupSize = 256;
 
-	unsigned int gainR;
-	unsigned int gainG;
-	unsigned int gainB;
+	struct CcmColumn {
+		int16_t r;
+		int16_t g;
+		int16_t b;
+	};
 
-	float gamma;
-	/**
-	 * \brief Level of the black point, 0..255, 0 is no correction.
+	using LookupTable = std::array<uint8_t, kRGBLookupSize>;
+	using CcmLookupTable = std::array<CcmColumn, kRGBLookupSize>;
+
+	/*
+	 * Color lookup tables when CCM is not used.
+	 *
+	 * Each color of a debayered pixel is amended by the corresponding
+	 * value in the given table.
 	 */
-	unsigned int blackLevel;
+	LookupTable red;
+	LookupTable green;
+	LookupTable blue;
+
+	/*
+	 * Color and gamma lookup tables when CCM is used.
+	 *
+	 * Each of the CcmLookupTable's corresponds to a CCM column; together they
+	 * make a complete 3x3 CCM lookup table. The CCM is applied on debayered
+	 * pixels and then the gamma lookup table is used to set the resulting
+	 * values of all the three colors.
+	 */
+	CcmLookupTable redCcm;
+	CcmLookupTable greenCcm;
+	CcmLookupTable blueCcm;
+	LookupTable gammaLut;
 };
 
 } /* namespace libcamera */

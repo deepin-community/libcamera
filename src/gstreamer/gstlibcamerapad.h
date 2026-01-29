@@ -23,6 +23,16 @@ GstLibcameraPool *gst_libcamera_pad_get_pool(GstPad *pad);
 
 void gst_libcamera_pad_set_pool(GstPad *pad, GstLibcameraPool *pool);
 
+GstBufferPool *gst_libcamera_pad_get_video_pool(GstPad *pad);
+
+void gst_libcamera_pad_set_video_pool(GstPad *pad, GstBufferPool *video_pool);
+
+GstVideoInfo gst_libcamera_pad_get_video_info(GstPad *pad);
+
+void gst_libcamera_pad_set_video_info(GstPad *pad, const GstVideoInfo *info);
+
 libcamera::Stream *gst_libcamera_pad_get_stream(GstPad *pad);
+
+void gst_libcamera_pad_set_stream(GstPad *pad, libcamera::Stream *stream);
 
 void gst_libcamera_pad_set_latency(GstPad *pad, GstClockTime latency);

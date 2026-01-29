@@ -13,8 +13,9 @@
 #include <memory>
 #include <queue>
 #include <set>
-#include <string>
+#include <stdint.h>
 #include <string.h>
+#include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -24,20 +25,25 @@
 #include <libcamera/base/log.h>
 
 #include <libcamera/camera.h>
+#include <libcamera/color_space.h>
 #include <libcamera/control_ids.h>
 #include <libcamera/request.h>
 #include <libcamera/stream.h>
 
 #include "libcamera/internal/camera.h"
+#include "libcamera/internal/camera_manager.h"
 #include "libcamera/internal/camera_sensor.h"
+#include "libcamera/internal/camera_sensor_properties.h"
 #include "libcamera/internal/converter.h"
+#include "libcamera/internal/delayed_controls.h"
 #include "libcamera/internal/device_enumerator.h"
+#include "libcamera/internal/formats.h"
+#include "libcamera/internal/global_configuration.h"
 #include "libcamera/internal/media_device.h"
 #include "libcamera/internal/pipeline_handler.h"
 #include "libcamera/internal/software_isp/software_isp.h"
 #include "libcamera/internal/v4l2_subdevice.h"
 #include "libcamera/internal/v4l2_videodevice.h"
-
 
 namespace libcamera {
 
@@ -164,7 +170,7 @@ LOG_DEFINE_CATEGORY(SimplePipeline)
  * handler has no a priori knowledge of. The pipeline handler thus implements a
  * heuristic to handle sharing of hardware resources in a generic fashion.
  *
- * Two cameras are considered to be mutually exclusive if their share common
+ * Two cameras are considered to be mutually exclusive if they share common
  * pads along the pipeline from the camera sensor to the video node. An entity
  * can thus be used concurrently by multiple cameras, as long as pads are
  * distinct.
@@ -178,6 +184,56 @@ LOG_DEFINE_CATEGORY(SimplePipeline)
  */
 
 class SimplePipelineHandler;
+
+struct SimpleFrameInfo {
+	SimpleFrameInfo(uint32_t f, Request *r, bool m)
+		: frame(f), request(r), metadataRequired(m), metadataProcessed(false)
+	{
+	}
+
+	uint32_t frame;
+	Request *request;
+	bool metadataRequired;
+	bool metadataProcessed;
+};
+
+class SimpleFrames
+{
+public:
+	void create(Request *request, bool metadataRequested);
+	void destroy(uint32_t frame);
+	void clear();
+
+	SimpleFrameInfo *find(uint32_t frame);
+
+private:
+	std::map<uint32_t, SimpleFrameInfo> frameInfo_;
+};
+
+void SimpleFrames::create(Request *request, bool metadataRequired)
+{
+	const uint32_t frame = request->sequence();
+	auto [it, inserted] = frameInfo_.try_emplace(frame, frame, request, metadataRequired);
+	ASSERT(inserted);
+}
+
+void SimpleFrames::destroy(uint32_t frame)
+{
+	frameInfo_.erase(frame);
+}
+
+void SimpleFrames::clear()
+{
+	frameInfo_.clear();
+}
+
+SimpleFrameInfo *SimpleFrames::find(uint32_t frame)
+{
+	auto info = frameInfo_.find(frame);
+	if (info == frameInfo_.end())
+		return nullptr;
+	return &info->second;
+}
 
 struct SimplePipelineInfo {
 	const char *driver;
@@ -199,7 +255,9 @@ namespace {
 static const SimplePipelineInfo supportedDevices[] = {
 	{ "dcmipp", {}, false },
 	{ "imx7-csi", { { "pxp", 1 } }, false },
-	{ "j721e-csi2rx", {}, false },
+	{ "intel-ipu6", {}, true },
+	{ "intel-ipu7", {}, true },
+	{ "j721e-csi2rx", {}, true },
 	{ "mtk-seninf", { { "mtk-mdp", 3 } }, false },
 	{ "mxc-isi", {}, false },
 	{ "qcom-camss", {}, true },
@@ -223,7 +281,8 @@ public:
 	int setupFormats(V4L2SubdeviceFormat *format,
 			 V4L2Subdevice::Whence whence,
 			 Transform transform = Transform::Identity);
-	void bufferReady(FrameBuffer *buffer);
+	void imageBufferReady(FrameBuffer *buffer);
+	void clearIncompleteRequests();
 
 	unsigned int streamIndex(const Stream *stream) const
 	{
@@ -273,25 +332,35 @@ public:
 	std::list<Entity> entities_;
 	std::unique_ptr<CameraSensor> sensor_;
 	V4L2VideoDevice *video_;
+	V4L2Subdevice *frameStartEmitter_;
 
 	std::vector<Configuration> configs_;
 	std::map<PixelFormat, std::vector<const Configuration *>> formats_;
 
+	std::unique_ptr<DelayedControls> delayedCtrls_;
+
 	std::vector<std::unique_ptr<FrameBuffer>> conversionBuffers_;
-	std::queue<std::map<unsigned int, FrameBuffer *>> conversionQueue_;
+	struct RequestOutputs {
+		Request *request;
+		std::map<const Stream *, FrameBuffer *> outputs;
+	};
+	std::queue<RequestOutputs> conversionQueue_;
 	bool useConversion_;
 
 	std::unique_ptr<Converter> converter_;
 	std::unique_ptr<SoftwareIsp> swIsp_;
+	SimpleFrames frameInfo_;
 
 private:
 	void tryPipeline(unsigned int code, const Size &size);
 	static std::vector<const MediaPad *> routedSourcePads(MediaPad *sink);
 
+	void tryCompleteRequest(Request *request);
 	void conversionInputDone(FrameBuffer *buffer);
 	void conversionOutputDone(FrameBuffer *buffer);
 
-	void ispStatsReady();
+	void ispStatsReady(uint32_t frame, uint32_t bufferId);
+	void metadataReady(uint32_t frame, const ControlList &metadata);
 	void setSensorControls(const ControlList &sensorControls);
 };
 
@@ -311,6 +380,9 @@ public:
 	const Transform &combinedTransform() const { return combinedTransform_; }
 
 private:
+	static constexpr unsigned int kNumBuffersDefault = 4;
+	static constexpr unsigned int kNumBuffersMax = 32;
+
 	/*
 	 * The SimpleCameraData instance is guaranteed to be valid as long as
 	 * the corresponding Camera instance is valid. In order to borrow a
@@ -343,14 +415,15 @@ public:
 
 	V4L2VideoDevice *video(const MediaEntity *entity);
 	V4L2Subdevice *subdev(const MediaEntity *entity);
-	MediaDevice *converter() { return converter_; }
+	std::shared_ptr<MediaDevice> converter() { return converter_; }
 	bool swIspEnabled() const { return swIspEnabled_; }
 
 protected:
 	int queueRequestDevice(Camera *camera, Request *request) override;
 
 private:
-	static constexpr unsigned int kNumInternalBuffers = 3;
+	static constexpr unsigned int kMaxQueuedRequestsDevice = 4;
+	static constexpr unsigned int kNumInternalBuffers = 4;
 
 	struct EntityData {
 		std::unique_ptr<V4L2VideoDevice> video;
@@ -363,16 +436,19 @@ private:
 		return static_cast<SimpleCameraData *>(camera->_d());
 	}
 
-	std::vector<MediaEntity *> locateSensors();
+	bool matchDevice(std::shared_ptr<MediaDevice> media,
+			 const SimplePipelineInfo &info,
+			 DeviceEnumerator *enumerator);
+
+	std::vector<MediaEntity *> locateSensors(MediaDevice *media);
 	static int resetRoutingTable(V4L2Subdevice *subdev);
 
 	const MediaPad *acquirePipeline(SimpleCameraData *data);
 	void releasePipeline(SimpleCameraData *data);
 
-	MediaDevice *media_;
 	std::map<const MediaEntity *, EntityData> entities_;
 
-	MediaDevice *converter_;
+	std::shared_ptr<MediaDevice> converter_;
 	bool swIspEnabled_;
 };
 
@@ -385,8 +461,6 @@ SimpleCameraData::SimpleCameraData(SimplePipelineHandler *pipe,
 				   MediaEntity *sensor)
 	: Camera::Private(pipe), streams_(numStreams)
 {
-	int ret;
-
 	/*
 	 * Find the shortest path from the camera sensor to a video capture
 	 * device using the breadth-first search algorithm. This heuristic will
@@ -477,12 +551,16 @@ SimpleCameraData::SimpleCameraData(SimplePipelineHandler *pipe,
 	}
 
 	/* Finally also remember the sensor. */
-	sensor_ = std::make_unique<CameraSensor>(sensor);
-	ret = sensor_->init();
-	if (ret) {
-		sensor_.reset();
+	sensor_ = CameraSensorFactoryBase::create(sensor);
+	if (!sensor_)
 		return;
-	}
+
+	const CameraSensorProperties::SensorDelays &delays = sensor_->sensorDelays();
+	std::unordered_map<uint32_t, DelayedControls::ControlParams> params = {
+		{ V4L2_CID_ANALOGUE_GAIN, { delays.gainDelay, false } },
+		{ V4L2_CID_EXPOSURE, { delays.exposureDelay, false } },
+	};
+	delayedCtrls_ = std::make_unique<DelayedControls>(sensor_->device(), params);
 
 	LOG(SimplePipeline, Debug)
 		<< "Found pipeline: "
@@ -510,7 +588,7 @@ int SimpleCameraData::init()
 	int ret;
 
 	/* Open the converter, if any. */
-	MediaDevice *converter = pipe->converter();
+	std::shared_ptr<MediaDevice> converter = pipe->converter();
 	if (converter) {
 		converter_ = ConverterFactoryBase::create(converter);
 		if (!converter_) {
@@ -527,29 +605,16 @@ int SimpleCameraData::init()
 	 * Instantiate Soft ISP if this is enabled for the given driver and no converter is used.
 	 */
 	if (!converter_ && pipe->swIspEnabled()) {
-		swIsp_ = std::make_unique<SoftwareIsp>(pipe, sensor_.get());
+		swIsp_ = std::make_unique<SoftwareIsp>(pipe, sensor_.get(), &controlInfo_);
 		if (!swIsp_->isValid()) {
 			LOG(SimplePipeline, Warning)
 				<< "Failed to create software ISP, disabling software debayering";
 			swIsp_.reset();
 		} else {
-			/*
-			 * The inputBufferReady signal is emitted from the soft ISP thread,
-			 * and needs to be handled in the pipeline handler thread. Signals
-			 * implement queued delivery, but this works transparently only if
-			 * the receiver is bound to the target thread. As the
-			 * SimpleCameraData class doesn't inherit from the Object class, it
-			 * is not bound to any thread, and the signal would be delivered
-			 * synchronously. Instead, connect the signal to a lambda function
-			 * bound explicitly to the pipe, which is bound to the pipeline
-			 * handler thread. The function then simply forwards the call to
-			 * conversionInputDone().
-			 */
-			swIsp_->inputBufferReady.connect(pipe, [this](FrameBuffer *buffer) {
-				this->conversionInputDone(buffer);
-			});
+			swIsp_->inputBufferReady.connect(this, &SimpleCameraData::conversionInputDone);
 			swIsp_->outputBufferReady.connect(this, &SimpleCameraData::conversionOutputDone);
 			swIsp_->ispStatsReady.connect(this, &SimpleCameraData::ispStatsReady);
+			swIsp_->metadataReady.connect(this, &SimpleCameraData::metadataReady);
 			swIsp_->setSensorControls.connect(this, &SimpleCameraData::setSensorControls);
 		}
 	}
@@ -588,6 +653,20 @@ int SimpleCameraData::init()
 	}
 
 	properties_ = sensor_->properties();
+
+	/* Find the first subdev that can generate a frame start signal, if any. */
+	frameStartEmitter_ = nullptr;
+	for (const Entity &entity : entities_) {
+		V4L2Subdevice *sd = pipe->subdev(entity.entity);
+		if (!sd || !sd->supportsFrameStartEvent())
+			continue;
+
+		LOG(SimplePipeline, Debug)
+			<< "Using frameStart signal from '"
+			<< entity.entity->name() << "'";
+		frameStartEmitter_ = sd;
+		break;
+	}
 
 	return 0;
 }
@@ -634,9 +713,14 @@ void SimpleCameraData::tryPipeline(unsigned int code, const Size &size)
 		<< " ]";
 
 	for (const auto &videoFormat : videoFormats) {
-		PixelFormat pixelFormat = videoFormat.first.toPixelFormat();
-		if (!pixelFormat)
+		PixelFormat pixelFormat = videoFormat.first.toPixelFormat(false);
+		if (!pixelFormat) {
+			LOG(SimplePipeline, Debug)
+				<< "Unsupported V4L2 pixel format "
+				<< videoFormat.first.toString();
+
 			continue;
+		}
 
 		Configuration config;
 		config.code = code;
@@ -774,17 +858,14 @@ int SimpleCameraData::setupFormats(V4L2SubdeviceFormat *format,
 		}
 
 		LOG(SimplePipeline, Debug)
-			<< "Link '" << source->entity()->name()
-			<< "':" << source->index()
-			<< " -> '" << sink->entity()->name()
-			<< "':" << sink->index()
-			<< " configured with format " << *format;
+			<< "Link " << *link << ": configured with format "
+			<< *format;
 	}
 
 	return 0;
 }
 
-void SimpleCameraData::bufferReady(FrameBuffer *buffer)
+void SimpleCameraData::imageBufferReady(FrameBuffer *buffer)
 {
 	SimplePipelineHandler *pipe = SimpleCameraData::pipe();
 
@@ -798,7 +879,7 @@ void SimpleCameraData::bufferReady(FrameBuffer *buffer)
 			/* No conversion, just complete the request. */
 			Request *request = buffer->request();
 			pipe->completeBuffer(request, buffer);
-			pipe->completeRequest(request);
+			tryCompleteRequest(request);
 			return;
 		}
 
@@ -813,16 +894,15 @@ void SimpleCameraData::bufferReady(FrameBuffer *buffer)
 		if (conversionQueue_.empty())
 			return;
 
-		Request *request = nullptr;
-		for (auto &item : conversionQueue_.front()) {
-			FrameBuffer *outputBuffer = item.second;
-			request = outputBuffer->request();
-			pipe->completeBuffer(request, outputBuffer);
-		}
+		const RequestOutputs &outputs = conversionQueue_.front();
+		for (auto &[stream, buf] : outputs.outputs)
+			pipe->completeBuffer(outputs.request, buf);
+		SimpleFrameInfo *info = frameInfo_.find(outputs.request->sequence());
+		if (info)
+			info->metadataRequired = false;
+		tryCompleteRequest(outputs.request);
 		conversionQueue_.pop();
 
-		if (request)
-			pipe->completeRequest(request);
 		return;
 	}
 
@@ -837,8 +917,8 @@ void SimpleCameraData::bufferReady(FrameBuffer *buffer)
 	Request *request = buffer->request();
 
 	if (useConversion_ && !conversionQueue_.empty()) {
-		const std::map<unsigned int, FrameBuffer *> &outputs =
-			conversionQueue_.front();
+		const std::map<const Stream *, FrameBuffer *> &outputs =
+			conversionQueue_.front().outputs;
 		if (!outputs.empty()) {
 			FrameBuffer *outputBuffer = outputs.begin()->second;
 			if (outputBuffer)
@@ -862,9 +942,15 @@ void SimpleCameraData::bufferReady(FrameBuffer *buffer)
 		}
 
 		if (converter_)
-			converter_->queueBuffers(buffer, conversionQueue_.front());
+			converter_->queueBuffers(buffer, conversionQueue_.front().outputs);
 		else
-			swIsp_->queueBuffers(buffer, conversionQueue_.front());
+			/*
+			 * request->sequence() cannot be retrieved from `buffer' inside
+			 * queueBuffers because unique_ptr's make buffer->request() invalid
+			 * already here.
+			 */
+			swIsp_->queueBuffers(request->sequence(), buffer,
+					     conversionQueue_.front().outputs);
 
 		conversionQueue_.pop();
 		return;
@@ -872,7 +958,33 @@ void SimpleCameraData::bufferReady(FrameBuffer *buffer)
 
 	/* Otherwise simply complete the request. */
 	pipe->completeBuffer(request, buffer);
-	pipe->completeRequest(request);
+	tryCompleteRequest(request);
+}
+
+void SimpleCameraData::clearIncompleteRequests()
+{
+	while (!conversionQueue_.empty()) {
+		pipe()->cancelRequest(conversionQueue_.front().request);
+		conversionQueue_.pop();
+	}
+}
+
+void SimpleCameraData::tryCompleteRequest(Request *request)
+{
+	if (request->hasPendingBuffers())
+		return;
+
+	SimpleFrameInfo *info = frameInfo_.find(request->sequence());
+	if (!info) {
+		/* Something is really wrong, let's return. */
+		return;
+	}
+
+	if (info->metadataRequired && !info->metadataProcessed)
+		return;
+
+	frameInfo_.destroy(info->frame);
+	pipe()->completeRequest(request);
 }
 
 void SimpleCameraData::conversionInputDone(FrameBuffer *buffer)
@@ -888,20 +1000,41 @@ void SimpleCameraData::conversionOutputDone(FrameBuffer *buffer)
 	/* Complete the buffer and the request. */
 	Request *request = buffer->request();
 	if (pipe->completeBuffer(request, buffer))
-		pipe->completeRequest(request);
+		tryCompleteRequest(request);
 }
 
-void SimpleCameraData::ispStatsReady()
+void SimpleCameraData::ispStatsReady(uint32_t frame, uint32_t bufferId)
 {
-	/* \todo Use the DelayedControls class */
-	swIsp_->processStats(sensor_->getControls({ V4L2_CID_ANALOGUE_GAIN,
-						    V4L2_CID_EXPOSURE }));
+	swIsp_->processStats(frame, bufferId,
+			     delayedCtrls_->get(frame));
+}
+
+void SimpleCameraData::metadataReady(uint32_t frame, const ControlList &metadata)
+{
+	SimpleFrameInfo *info = frameInfo_.find(frame);
+	if (!info)
+		return;
+
+	info->request->metadata().merge(metadata);
+	info->metadataProcessed = true;
+	tryCompleteRequest(info->request);
 }
 
 void SimpleCameraData::setSensorControls(const ControlList &sensorControls)
 {
-	ControlList ctrls(sensorControls);
-	sensor_->setControls(&ctrls);
+	delayedCtrls_->push(sensorControls);
+	/*
+	 * Directly apply controls now if there is no frameStart signal.
+	 *
+	 * \todo Applying controls directly not only increases the risk of
+	 * applying them to the wrong frame (or across a frame boundary),
+	 * but it also bypasses delayedCtrls_, creating AGC regulation issues.
+	 * Both problems should be fixed.
+	 */
+	if (!frameStartEmitter_) {
+		ControlList ctrls(sensorControls);
+		sensor_->setControls(&ctrls);
+	}
 }
 
 /* Retrieve all source pads connected to a sink pad through active routes. */
@@ -1039,15 +1172,16 @@ CameraConfiguration::Status SimpleCameraConfiguration::validate()
 	pipeConfig_ = nullptr;
 
 	for (const SimpleCameraData::Configuration *pipeConfig : *configs) {
-		const Size &size = pipeConfig->captureSize;
+		const Size &captureSize = pipeConfig->captureSize;
+		const Size &maxOutputSize = pipeConfig->outputSizes.max;
 
-		if (size.width >= maxStreamSize.width &&
-		    size.height >= maxStreamSize.height) {
-			if (!pipeConfig_ || size < pipeConfig_->captureSize)
+		if (maxOutputSize.width >= maxStreamSize.width &&
+		    maxOutputSize.height >= maxStreamSize.height) {
+			if (!pipeConfig_ || captureSize < pipeConfig_->captureSize)
 				pipeConfig_ = pipeConfig;
 		}
 
-		if (!maxPipeConfig || maxPipeConfig->captureSize < size)
+		if (!maxPipeConfig || maxPipeConfig->captureSize < captureSize)
 			maxPipeConfig = pipeConfig;
 	}
 
@@ -1089,9 +1223,49 @@ CameraConfiguration::Status SimpleCameraConfiguration::validate()
 
 		PixelFormat pixelFormat = *it;
 		if (cfg.pixelFormat != pixelFormat) {
-			LOG(SimplePipeline, Debug) << "Adjusting pixel format";
+			LOG(SimplePipeline, Debug)
+				<< "Adjusting pixel format from "
+				<< cfg.pixelFormat << " to " << pixelFormat;
 			cfg.pixelFormat = pixelFormat;
 			status = Adjusted;
+		}
+
+		/*
+		 * Best effort to fix the color space. If the color space is not set,
+		 * set it according to the pixel format, which may not be correct (pixel
+		 * formats and color spaces are different things, although somewhat
+		 * related) but we don't have a better option at the moment. Then in any
+		 * case, perform the standard pixel format based color space adjustment.
+		 */
+		if (!cfg.colorSpace) {
+			const PixelFormatInfo &info = PixelFormatInfo::info(pixelFormat);
+			switch (info.colourEncoding) {
+			case PixelFormatInfo::ColourEncodingRGB:
+				cfg.colorSpace = ColorSpace::Srgb;
+				break;
+			case PixelFormatInfo::ColourEncodingYUV:
+				cfg.colorSpace = ColorSpace::Sycc;
+				break;
+			default:
+				cfg.colorSpace = ColorSpace::Raw;
+			}
+			LOG(SimplePipeline, Debug)
+				<< "Unspecified color space set to "
+				<< cfg.colorSpace.value().toString();
+			/*
+			 * Adjust the assigned color space to make sure everything is OK.
+			 * Since this is assigning an unspecified color space rather than
+			 * adjusting a requested one, changes here shouldn't set the status
+			 * to Adjusted.
+			 */
+			cfg.colorSpace->adjust(pixelFormat);
+		} else {
+			if (cfg.colorSpace->adjust(pixelFormat)) {
+				LOG(SimplePipeline, Debug)
+					<< "Color space adjusted to "
+					<< cfg.colorSpace.value().toString();
+				status = Adjusted;
+			}
 		}
 
 		if (!pipeConfig_->outputSizes.contains(cfg.size)) {
@@ -1116,7 +1290,7 @@ CameraConfiguration::Status SimpleCameraConfiguration::validate()
 		    cfg.size != pipeConfig_->captureSize)
 			needConversion_ = true;
 
-		/* Set the stride, frameSize and bufferCount. */
+		/* Set the stride and frameSize. */
 		if (needConversion_) {
 			std::tie(cfg.stride, cfg.frameSize) =
 				data_->converter_
@@ -1139,7 +1313,18 @@ CameraConfiguration::Status SimpleCameraConfiguration::validate()
 			cfg.frameSize = format.planes[0].size;
 		}
 
-		cfg.bufferCount = 3;
+		const unsigned int bufferCount = cfg.bufferCount;
+		if (!bufferCount)
+			cfg.bufferCount = kNumBuffersDefault;
+		else if (bufferCount > kNumBuffersMax)
+			cfg.bufferCount = kNumBuffersMax;
+
+		if (cfg.bufferCount != bufferCount) {
+			LOG(SimplePipeline, Debug)
+				<< "Adjusting bufferCount from " << bufferCount
+				<< " to " << cfg.bufferCount;
+			status = Adjusted;
+		}
 	}
 
 	return status;
@@ -1150,7 +1335,8 @@ CameraConfiguration::Status SimpleCameraConfiguration::validate()
  */
 
 SimplePipelineHandler::SimplePipelineHandler(CameraManager *manager)
-	: PipelineHandler(manager), converter_(nullptr)
+	: PipelineHandler(manager, kMaxQueuedRequestsDevice),
+	  converter_(nullptr)
 {
 }
 
@@ -1238,8 +1424,20 @@ int SimplePipelineHandler::configure(Camera *camera, CameraConfiguration *c)
 	if (ret < 0)
 		return ret;
 
-	/* Configure the video node. */
-	V4L2PixelFormat videoFormat = video->toV4L2PixelFormat(pipeConfig->captureFormat);
+	/* Configure the video node, taking into account any Bayer pattern change. */
+	V4L2PixelFormat videoFormat;
+	if (format.code == pipeConfig->code) {
+		videoFormat = video->toV4L2PixelFormat(pipeConfig->captureFormat);
+	} else {
+		/*
+		 * Bayer pattern has changed because of the transform that was applied on
+		 * the sensor. Get the V4L2PixelFormat corresponding to the configured Bayer
+		 * pattern.
+		 */
+		BayerFormat cfgBayer = BayerFormat::fromPixelFormat(pipeConfig->captureFormat);
+		cfgBayer.order = data->sensor_->bayerOrder(config->combinedTransform());
+		videoFormat = cfgBayer.toV4L2PixelFormat();
+	}
 
 	V4L2DeviceFormat captureFormat;
 	captureFormat.fourcc = videoFormat;
@@ -1281,15 +1479,18 @@ int SimplePipelineHandler::configure(Camera *camera, CameraConfiguration *c)
 		return 0;
 
 	StreamConfiguration inputCfg;
-	inputCfg.pixelFormat = pipeConfig->captureFormat;
+	inputCfg.pixelFormat = videoFormat.toPixelFormat();
 	inputCfg.size = pipeConfig->captureSize;
 	inputCfg.stride = captureFormat.planes[0].bpl;
 	inputCfg.bufferCount = kNumInternalBuffers;
 
-	return data->converter_
-		       ? data->converter_->configure(inputCfg, outputCfgs)
-		       : data->swIsp_->configure(inputCfg, outputCfgs,
-						 data->sensor_->controls());
+	if (data->converter_) {
+		return data->converter_->configure(inputCfg, outputCfgs);
+	} else {
+		ipa::soft::IPAConfigInfo configInfo;
+		configInfo.sensorControls = data->sensor_->controls();
+		return data->swIsp_->configure(inputCfg, outputCfgs, configInfo);
+	}
 }
 
 int SimplePipelineHandler::exportFrameBuffers(Camera *camera, Stream *stream,
@@ -1304,10 +1505,8 @@ int SimplePipelineHandler::exportFrameBuffers(Camera *camera, Stream *stream,
 	 */
 	if (data->useConversion_)
 		return data->converter_
-			       ? data->converter_->exportBuffers(data->streamIndex(stream),
-								 count, buffers)
-			       : data->swIsp_->exportBuffers(data->streamIndex(stream),
-							     count, buffers);
+			       ? data->converter_->exportBuffers(stream, count, buffers)
+			       : data->swIsp_->exportBuffers(stream, count, buffers);
 	else
 		return data->video_->exportBuffers(count, buffers);
 }
@@ -1316,6 +1515,7 @@ int SimplePipelineHandler::start(Camera *camera, [[maybe_unused]] const ControlL
 {
 	SimpleCameraData *data = cameraData(camera);
 	V4L2VideoDevice *video = data->video_;
+	V4L2Subdevice *frameStartEmitter = data->frameStartEmitter_;
 	int ret;
 
 	const MediaPad *pad = acquirePipeline(data);
@@ -1343,7 +1543,18 @@ int SimplePipelineHandler::start(Camera *camera, [[maybe_unused]] const ControlL
 		return ret;
 	}
 
-	video->bufferReady.connect(data, &SimpleCameraData::bufferReady);
+	video->bufferReady.connect(data, &SimpleCameraData::imageBufferReady);
+
+	data->delayedCtrls_->reset();
+	if (frameStartEmitter) {
+		ret = frameStartEmitter->setFrameStartEnabled(true);
+		if (ret) {
+			stop(camera);
+			return ret;
+		}
+		frameStartEmitter->frameStart.connect(data->delayedCtrls_.get(),
+						      &DelayedControls::applyControls);
+	}
 
 	ret = video->streamOn();
 	if (ret < 0) {
@@ -1376,6 +1587,13 @@ void SimplePipelineHandler::stopDevice(Camera *camera)
 {
 	SimpleCameraData *data = cameraData(camera);
 	V4L2VideoDevice *video = data->video_;
+	V4L2Subdevice *frameStartEmitter = data->frameStartEmitter_;
+
+	if (frameStartEmitter) {
+		frameStartEmitter->setFrameStartEnabled(false);
+		frameStartEmitter->frameStart.disconnect(data->delayedCtrls_.get(),
+							 &DelayedControls::applyControls);
+	}
 
 	if (data->useConversion_) {
 		if (data->converter_)
@@ -1387,8 +1605,10 @@ void SimplePipelineHandler::stopDevice(Camera *camera)
 	video->streamOff();
 	video->releaseBuffers();
 
-	video->bufferReady.disconnect(data, &SimpleCameraData::bufferReady);
+	video->bufferReady.disconnect(data, &SimpleCameraData::imageBufferReady);
 
+	data->frameInfo_.clear();
+	data->clearIncompleteRequests();
 	data->conversionBuffers_.clear();
 
 	releasePipeline(data);
@@ -1399,7 +1619,7 @@ int SimplePipelineHandler::queueRequestDevice(Camera *camera, Request *request)
 	SimpleCameraData *data = cameraData(camera);
 	int ret;
 
-	std::map<unsigned int, FrameBuffer *> buffers;
+	std::map<const Stream *, FrameBuffer *> buffers;
 
 	for (auto &[stream, buffer] : request->buffers()) {
 		/*
@@ -1408,7 +1628,7 @@ int SimplePipelineHandler::queueRequestDevice(Camera *camera, Request *request)
 		 * completion handler.
 		 */
 		if (data->useConversion_) {
-			buffers.emplace(data->streamIndex(stream), buffer);
+			buffers.emplace(stream, buffer);
 		} else {
 			ret = data->video_->queueBuffer(buffer);
 			if (ret < 0)
@@ -1416,8 +1636,12 @@ int SimplePipelineHandler::queueRequestDevice(Camera *camera, Request *request)
 		}
 	}
 
-	if (data->useConversion_)
-		data->conversionQueue_.push(std::move(buffers));
+	data->frameInfo_.create(request, !!data->swIsp_);
+	if (data->useConversion_) {
+		data->conversionQueue_.push({ request, std::move(buffers) });
+		if (data->swIsp_)
+			data->swIsp_->queueRequest(request->sequence(), request->controls());
+	}
 
 	return 0;
 }
@@ -1426,7 +1650,8 @@ int SimplePipelineHandler::queueRequestDevice(Camera *camera, Request *request)
  * Match and Setup
  */
 
-std::vector<MediaEntity *> SimplePipelineHandler::locateSensors()
+std::vector<MediaEntity *>
+SimplePipelineHandler::locateSensors(MediaDevice *media)
 {
 	std::vector<MediaEntity *> entities;
 
@@ -1434,7 +1659,7 @@ std::vector<MediaEntity *> SimplePipelineHandler::locateSensors()
 	 * Gather all the camera sensor entities based on the function they
 	 * expose.
 	 */
-	for (MediaEntity *entity : media_->entities()) {
+	for (MediaEntity *entity : media->entities()) {
 		if (entity->function() == MEDIA_ENT_F_CAM_SENSOR)
 			entities.push_back(entity);
 	}
@@ -1518,24 +1743,13 @@ int SimplePipelineHandler::resetRoutingTable(V4L2Subdevice *subdev)
 	return 0;
 }
 
-bool SimplePipelineHandler::match(DeviceEnumerator *enumerator)
+bool SimplePipelineHandler::matchDevice(std::shared_ptr<MediaDevice> media,
+					const SimplePipelineInfo &info,
+					DeviceEnumerator *enumerator)
 {
-	const SimplePipelineInfo *info = nullptr;
 	unsigned int numStreams = 1;
 
-	for (const SimplePipelineInfo &inf : supportedDevices) {
-		DeviceMatch dm(inf.driver);
-		media_ = acquireMediaDevice(enumerator, dm);
-		if (media_) {
-			info = &inf;
-			break;
-		}
-	}
-
-	if (!media_)
-		return false;
-
-	for (const auto &[name, streams] : info->converters) {
+	for (const auto &[name, streams] : info.converters) {
 		DeviceMatch converterMatch(name);
 		converter_ = acquireMediaDevice(enumerator, converterMatch);
 		if (converter_) {
@@ -1544,14 +1758,29 @@ bool SimplePipelineHandler::match(DeviceEnumerator *enumerator)
 		}
 	}
 
-	swIspEnabled_ = info->swIspEnabled;
+	swIspEnabled_ = info.swIspEnabled;
+	const GlobalConfiguration &configuration = cameraManager()->_d()->configuration();
+	for (GlobalConfiguration::Configuration entry :
+	     configuration.configuration()["pipelines"]["simple"]["supported_devices"]
+		     .asList()) {
+		auto name = entry["driver"].get<std::string>();
+		if (name == info.driver) {
+			swIspEnabled_ = entry["software_isp"].get<bool>().value_or(swIspEnabled_);
+			LOG(SimplePipeline, Debug)
+				<< "Configuration file overrides software ISP for "
+				<< info.driver << " to " << swIspEnabled_;
+			break;
+		}
+	}
 
 	/* Locate the sensors. */
-	std::vector<MediaEntity *> sensors = locateSensors();
+	std::vector<MediaEntity *> sensors = locateSensors(media.get());
 	if (sensors.empty()) {
-		LOG(SimplePipeline, Error) << "No sensor found";
+		LOG(SimplePipeline, Info) << "No sensor found for " << media->deviceNode();
 		return false;
 	}
+
+	LOG(SimplePipeline, Debug) << "Sensor found for " << media->deviceNode();
 
 	/*
 	 * Create one camera data instance for each sensor and gather all
@@ -1616,8 +1845,8 @@ bool SimplePipelineHandler::match(DeviceEnumerator *enumerator)
 			if (subdev->caps().hasStreams()) {
 				/*
 				 * Reset the routing table to its default state
-				 * to make sure entities are enumerate according
-				 * to the defaul routing configuration.
+				 * to make sure entities are enumerated according
+				 * to the default routing configuration.
 				 */
 				ret = resetRoutingTable(subdev.get());
 				if (ret) {
@@ -1659,6 +1888,43 @@ bool SimplePipelineHandler::match(DeviceEnumerator *enumerator)
 	}
 
 	return registered;
+}
+
+bool SimplePipelineHandler::match(DeviceEnumerator *enumerator)
+{
+	std::shared_ptr<MediaDevice> media;
+
+	for (const SimplePipelineInfo &inf : supportedDevices) {
+		DeviceMatch dm(inf.driver);
+		while ((media = acquireMediaDevice(enumerator, dm))) {
+			/*
+			 * If match succeeds, return true to let match() be
+			 * called again on a new instance of the pipeline
+			 * handler. Otherwise keep looping until we do
+			 * successfully match one (or run out).
+			 */
+			if (matchDevice(media, inf, enumerator)) {
+				LOG(SimplePipeline, Debug)
+					<< "Matched on device: "
+					<< media->deviceNode();
+				return true;
+			}
+
+			/*
+			 * \todo We need to clear the list of media devices
+			 * that we've already acquired in the event that we
+			 * fail to create a camera. This requires a rework of
+			 * DeviceEnumerator, or even how we create pipelines
+			 * handlers. This is because at the moment acquired
+			 * media devices are only released on pipeline handler
+			 * deconstruction, and if we release them any earlier
+			 * then DeviceEnumerator::search() will keep returning
+			 * the same media devices.
+			 */
+		}
+	}
+
+	return false;
 }
 
 V4L2VideoDevice *SimplePipelineHandler::video(const MediaEntity *entity)

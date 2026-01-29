@@ -10,6 +10,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <stdint.h>
 #include <vector>
 
 #include <linux/videodev2.h>
@@ -23,6 +24,7 @@
 #include <libcamera/controls.h>
 
 #include "libcamera/internal/formats.h"
+#include "libcamera/internal/v4l2_request.h"
 
 namespace libcamera {
 
@@ -36,14 +38,15 @@ public:
 
 	const ControlInfoMap &controls() const { return controls_; }
 
-	ControlList getControls(const std::vector<uint32_t> &ids);
-	int setControls(ControlList *ctrls);
+	ControlList getControls(Span<const uint32_t> ids, const V4L2Request *request = nullptr);
+	int setControls(ControlList *ctrls, const V4L2Request *request = nullptr);
 
 	const struct v4l2_query_ext_ctrl *controlInfo(uint32_t id) const;
 
 	const std::string &deviceNode() const { return deviceNode_; }
 	std::string devicePath() const;
 
+	bool supportsFrameStartEvent();
 	int setFrameStartEnabled(bool enable);
 	Signal<uint32_t> frameStart;
 

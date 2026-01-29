@@ -7,8 +7,8 @@
 
 #include "cio2.h"
 
+#include <cmath>
 #include <limits>
-#include <math.h>
 
 #include <linux/media-bus-format.h>
 
@@ -112,7 +112,7 @@ std::vector<SizeRange> CIO2Device::sizes(const PixelFormat &format) const
  * \return 0 on success or a negative error code otherwise
  * \retval -ENODEV No supported image sensor is connected to this CIO2 instance
  */
-int CIO2Device::init(const MediaDevice *media, unsigned int index)
+int CIO2Device::init(std::shared_ptr<const MediaDevice> media, unsigned int index)
 {
 	int ret;
 
@@ -134,10 +134,9 @@ int CIO2Device::init(const MediaDevice *media, unsigned int index)
 
 	MediaLink *link = links[0];
 	MediaEntity *sensorEntity = link->source()->entity();
-	sensor_ = std::make_unique<CameraSensor>(sensorEntity);
-	ret = sensor_->init();
-	if (ret)
-		return ret;
+	sensor_ = CameraSensorFactoryBase::create(sensorEntity);
+	if (!sensor_)
+		return -ENODEV;
 
 	ret = link->setEnabled(true);
 	if (ret)
@@ -171,7 +170,7 @@ int CIO2Device::init(const MediaDevice *media, unsigned int index)
 		return ret;
 
 	std::string cio2Name = "ipu3-cio2 " + std::to_string(index);
-	output_ = V4L2VideoDevice::fromEntityName(media, cio2Name);
+	output_ = V4L2VideoDevice::fromEntityName(media.get(), cio2Name);
 	return output_->open();
 }
 
@@ -304,7 +303,7 @@ V4L2SubdeviceFormat CIO2Device::getSensorFormat(const std::vector<unsigned int> 
 			 * comparing it with a single precision digit is enough.
 			 */
 			ratio = static_cast<unsigned int>(ratio * 10) / 10.0;
-			float ratioDiff = fabsf(ratio - desiredRatio);
+			float ratioDiff = std::abs(ratio - desiredRatio);
 			unsigned int area = sz.width * sz.height;
 			unsigned int areaDiff = area - desiredArea;
 

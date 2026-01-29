@@ -22,7 +22,6 @@
 #include "libcamera/internal/camera.h"
 #include "libcamera/internal/camera_manager.h"
 #include "libcamera/internal/device_enumerator.h"
-#include "libcamera/internal/framebuffer.h"
 #include "libcamera/internal/media_device.h"
 #include "libcamera/internal/request.h"
 #include "libcamera/internal/tracepoints.h"
@@ -63,19 +62,23 @@ LOG_DEFINE_CATEGORY(Pipeline)
 /**
  * \brief Construct a PipelineHandler instance
  * \param[in] manager The camera manager
+ * \param[in] maxQueuedRequestsDevice The maximum number of requests queued to
+ * the device
  *
  * In order to honour the std::enable_shared_from_this<> contract,
  * PipelineHandler instances shall never be constructed manually, but always
  * through the PipelineHandlerFactoryBase::create() function.
  */
-PipelineHandler::PipelineHandler(CameraManager *manager)
-	: manager_(manager), useCount_(0)
+PipelineHandler::PipelineHandler(CameraManager *manager,
+				 unsigned int maxQueuedRequestsDevice)
+	: manager_(manager), maxQueuedRequestsDevice_(maxQueuedRequestsDevice),
+	  useCount_(0)
 {
 }
 
 PipelineHandler::~PipelineHandler()
 {
-	for (std::shared_ptr<MediaDevice> media : mediaDevices_)
+	for (std::shared_ptr<MediaDevice> &media : mediaDevices_)
 		media->release();
 }
 
@@ -126,10 +129,12 @@ PipelineHandler::~PipelineHandler()
  *
  * \context This function shall be called from the CameraManager thread.
  *
- * \return A pointer to the matching MediaDevice, or nullptr if no match is found
+ * \return A shared pointer to the matching MediaDevice, or nullptr if no match
+ * is found
  */
-MediaDevice *PipelineHandler::acquireMediaDevice(DeviceEnumerator *enumerator,
-						 const DeviceMatch &dm)
+std::shared_ptr<MediaDevice>
+PipelineHandler::acquireMediaDevice(DeviceEnumerator *enumerator,
+				    const DeviceMatch &dm)
 {
 	std::shared_ptr<MediaDevice> media = enumerator->search(dm);
 	if (!media)
@@ -140,7 +145,7 @@ MediaDevice *PipelineHandler::acquireMediaDevice(DeviceEnumerator *enumerator,
 
 	mediaDevices_.push_back(media);
 
-	return media.get();
+	return media;
 }
 
 /**
@@ -157,26 +162,28 @@ MediaDevice *PipelineHandler::acquireMediaDevice(DeviceEnumerator *enumerator,
  * Pipeline handlers shall not call this function directly as the Camera class
  * handles access internally.
  *
- * \context This function is \threadsafe.
+ * \context This function is called from the CameraManager thread.
  *
  * \return True if the pipeline handler was acquired, false if another process
  * has already acquired it
  * \sa release()
  */
-bool PipelineHandler::acquire()
+bool PipelineHandler::acquire(Camera *camera)
 {
-	MutexLocker locker(lock_);
-
-	if (useCount_) {
-		++useCount_;
-		return true;
+	if (useCount_ == 0) {
+		for (std::shared_ptr<MediaDevice> &media : mediaDevices_) {
+			if (!media->lock()) {
+				unlockMediaDevices();
+				return false;
+			}
+		}
 	}
 
-	for (std::shared_ptr<MediaDevice> &media : mediaDevices_) {
-		if (!media->lock()) {
+	if (!acquireDevice(camera)) {
+		if (useCount_ == 0)
 			unlockMediaDevices();
-			return false;
-		}
+
+		return false;
 	}
 
 	++useCount_;
@@ -195,21 +202,43 @@ bool PipelineHandler::acquire()
  * Pipeline handlers shall not call this function directly as the Camera class
  * handles access internally.
  *
- * \context This function is \threadsafe.
+ * \context This function is called from the CameraManager thread.
  *
  * \sa acquire()
  */
 void PipelineHandler::release(Camera *camera)
 {
-	MutexLocker locker(lock_);
-
 	ASSERT(useCount_);
-
-	unlockMediaDevices();
 
 	releaseDevice(camera);
 
+	if (useCount_ == 1)
+		unlockMediaDevices();
+
 	--useCount_;
+}
+
+/**
+ * \brief Acquire resources associated with this camera
+ * \param[in] camera The camera for which to acquire resources
+ *
+ * Pipeline handlers may override this in order to get resources such as opening
+ * devices and allocating buffers when a camera is acquired.
+ *
+ * This is used by the uvcvideo pipeline handler to delay opening /dev/video#
+ * until the camera is acquired to avoid excess power consumption. The delayed
+ * opening of /dev/video# is a special case because the kernel uvcvideo driver
+ * powers on the USB device as soon as /dev/video# is opened. This behavior
+ * should *not* be copied by other pipeline handlers.
+ *
+ * \context This function is called from the CameraManager thread.
+ *
+ * \return True on success, false on failure
+ * \sa releaseDevice()
+ */
+bool PipelineHandler::acquireDevice([[maybe_unused]] Camera *camera)
+{
+	return true;
 }
 
 /**
@@ -218,6 +247,15 @@ void PipelineHandler::release(Camera *camera)
  *
  * Pipeline handlers may override this in order to perform cleanup operations
  * when a camera is released, such as freeing memory.
+ *
+ * This is called once for every camera that is released. If there are resources
+ * shared by multiple cameras then the pipeline handler must take care to not
+ * release them until releaseDevice() has been called for all previously
+ * acquired cameras.
+ *
+ * \context This function is called from the CameraManager thread.
+ *
+ * \sa acquireDevice()
  */
 void PipelineHandler::releaseDevice([[maybe_unused]] Camera *camera)
 {
@@ -328,21 +366,37 @@ void PipelineHandler::unlockMediaDevices()
  */
 void PipelineHandler::stop(Camera *camera)
 {
+	/*
+	 * Take all waiting requests so that they are not requeued in response
+	 * to completeRequest() being called inside stopDevice(). Cancel them
+	 * after the device to keep them in order.
+	 */
+	Camera::Private *data = camera->_d();
+	std::queue<Request *> waitingRequests;
+	waitingRequests.swap(data->waitingRequests_);
+
 	/* Stop the pipeline handler and let the queued requests complete. */
 	stopDevice(camera);
 
 	/* Cancel and signal as complete all waiting requests. */
-	while (!waitingRequests_.empty()) {
-		Request *request = waitingRequests_.front();
-		waitingRequests_.pop();
+	while (!waitingRequests.empty()) {
+		Request *request = waitingRequests.front();
+		waitingRequests.pop();
 
+		/*
+		 * Cancel all requests by marking them as cancelled and calling
+		 * doQueueRequest() instead of cancelRequest(). This ensures
+		 * that the requests get a sequence number and are temporarily
+		 * added to queuedRequests_ so they can be properly completed in
+		 * completeRequest().
+		 */
 		request->_d()->cancel();
-		completeRequest(request);
+		doQueueRequest(request);
 	}
 
 	/* Make sure no requests are pending. */
-	Camera::Private *data = camera->_d();
 	ASSERT(data->queuedRequests_.empty());
+	ASSERT(data->waitingRequests_.empty());
 
 	data->requestSequence_ = 0;
 }
@@ -384,7 +438,9 @@ void PipelineHandler::registerRequest(Request *request)
 	 * Connect the request prepared signal to notify the pipeline handler
 	 * when a request is ready to be processed.
 	 */
-	request->_d()->prepared.connect(this, &PipelineHandler::doQueueRequests);
+	request->_d()->prepared.connect(this, [this, request]() {
+		doQueueRequests(request->_d()->camera());
+	});
 }
 
 /**
@@ -397,9 +453,9 @@ void PipelineHandler::registerRequest(Request *request)
  * requests which have to be prepared to make sure they are ready for being
  * queued to the pipeline handler.
  *
- * The queue of waiting requests is iterated and all prepared requests are
- * passed to the pipeline handler in the same order they have been queued by
- * calling this function.
+ * The queue of waiting requests is iterated and up to \a
+ * maxQueuedRequestsDevice_ prepared requests are passed to the pipeline handler
+ * in the same order they have been queued by calling this function.
  *
  * If a Request fails during the preparation phase or if the pipeline handler
  * fails in queuing the request to the hardware the request is cancelled.
@@ -414,7 +470,9 @@ void PipelineHandler::queueRequest(Request *request)
 {
 	LIBCAMERA_TRACEPOINT(request_queue, request);
 
-	waitingRequests_.push(request);
+	Camera *camera = request->_d()->camera();
+	Camera::Private *data = camera->_d();
+	data->waitingRequests_.push(request);
 
 	request->_d()->prepare(300ms);
 }
@@ -438,10 +496,8 @@ void PipelineHandler::doQueueRequest(Request *request)
 	}
 
 	int ret = queueRequestDevice(camera, request);
-	if (ret) {
-		request->_d()->cancel();
-		completeRequest(request);
-	}
+	if (ret)
+		cancelRequest(request);
 }
 
 /**
@@ -450,15 +506,23 @@ void PipelineHandler::doQueueRequest(Request *request)
  * Iterate the list of waiting requests and queue them to the device one
  * by one if they have been prepared.
  */
-void PipelineHandler::doQueueRequests()
+void PipelineHandler::doQueueRequests(Camera *camera)
 {
-	while (!waitingRequests_.empty()) {
-		Request *request = waitingRequests_.front();
+	Camera::Private *data = camera->_d();
+	while (!data->waitingRequests_.empty()) {
+		if (data->queuedRequests_.size() == maxQueuedRequestsDevice_)
+			break;
+
+		Request *request = data->waitingRequests_.front();
 		if (!request->_d()->prepared_)
 			break;
 
+		/*
+		 * Pop the request first, in case doQueueRequests() is called
+		 * recursively from within doQueueRequest()
+		 */
+		data->waitingRequests_.pop();
 		doQueueRequest(request);
-		waitingRequests_.pop();
 	}
 }
 
@@ -534,12 +598,29 @@ void PipelineHandler::completeRequest(Request *request)
 		data->queuedRequests_.pop_front();
 		camera->requestComplete(req);
 	}
+
+	/* Allow any waiting requests to be queued to the pipeline. */
+	doQueueRequests(camera);
+}
+
+/**
+ * \brief Cancel request and signal its completion
+ * \param[in] request The request to cancel
+ *
+ * This function cancels and completes the request. The same rules as for
+ * completeRequest() apply.
+ */
+void PipelineHandler::cancelRequest(Request *request)
+{
+	request->_d()->cancel();
+	completeRequest(request);
 }
 
 /**
  * \brief Retrieve the absolute path to a platform configuration file
  * \param[in] subdir The pipeline handler specific subdirectory name
  * \param[in] name The configuration file name
+ * \param[in] silent Disable error messages
  *
  * This function locates a named platform configuration file and returns
  * its absolute path to the pipeline handler. It searches the following
@@ -555,7 +636,8 @@ void PipelineHandler::completeRequest(Request *request)
  * string if no configuration file can be found
  */
 std::string PipelineHandler::configurationFile(const std::string &subdir,
-					       const std::string &name) const
+					       const std::string &name,
+					       bool silent) const
 {
 	std::string confPath;
 	struct stat statbuf;
@@ -585,9 +667,11 @@ std::string PipelineHandler::configurationFile(const std::string &subdir,
 	if (ret == 0 && (statbuf.st_mode & S_IFMT) == S_IFREG)
 		return confPath;
 
-	LOG(Pipeline, Error)
-		<< "Configuration file '" << confPath
-		<< "' not found for pipeline handler '" << PipelineHandler::name() << "'";
+	if (!silent)
+		LOG(Pipeline, Error)
+			<< "Configuration file '" << confPath
+			<< "' not found for pipeline handler '"
+			<< PipelineHandler::name() << "'";
 
 	return std::string();
 }
@@ -605,9 +689,14 @@ void PipelineHandler::registerCamera(std::shared_ptr<Camera> camera)
 {
 	cameras_.push_back(camera);
 
-	if (mediaDevices_.empty())
-		LOG(Pipeline, Fatal)
-			<< "Registering camera with no media devices!";
+	if (mediaDevices_.empty()) {
+		/*
+		 * For virtual devices with no MediaDevice, there are no system
+		 * devices to register.
+		 */
+		manager_->_d()->addCamera(std::move(camera));
+		return;
+	}
 
 	/*
 	 * Walk the entity list and map the devnums of all capture video nodes
@@ -647,7 +736,7 @@ void PipelineHandler::registerCamera(std::shared_ptr<Camera> camera)
  * handler gets notified and automatically disconnects all the cameras it has
  * registered without requiring any manual intervention.
  */
-void PipelineHandler::hotplugMediaDevice(MediaDevice *media)
+void PipelineHandler::hotplugMediaDevice(std::shared_ptr<MediaDevice> media)
 {
 	media->disconnected.connect(this, [this, media] { mediaDeviceDisconnected(media); });
 }
@@ -655,7 +744,7 @@ void PipelineHandler::hotplugMediaDevice(MediaDevice *media)
 /**
  * \brief Slot for the MediaDevice disconnected signal
  */
-void PipelineHandler::mediaDeviceDisconnected(MediaDevice *media)
+void PipelineHandler::mediaDeviceDisconnected(std::shared_ptr<MediaDevice> media)
 {
 	media->disconnected.disconnect(this);
 
@@ -713,10 +802,37 @@ void PipelineHandler::disconnect()
  */
 
 /**
+ * \var PipelineHandler::maxQueuedRequestsDevice_
+ * \brief The maximum number of requests the pipeline handler shall queue to the
+ * device
+ *
+ * maxQueuedRequestsDevice_ limits the number of request that the
+ * pipeline handler shall queue to the underlying hardware, in order to
+ * saturate the pipeline with requests. The application may choose to queue
+ * as many requests as it desires, however only maxQueuedRequestsDevice_
+ * requests will be queued to the hardware at a given point in time. The
+ * remaining requests will be kept waiting in the internal waiting
+ * queue, to be queued at a later stage.
+ */
+
+/**
  * \fn PipelineHandler::name()
  * \brief Retrieve the pipeline handler name
  * \context This function shall be \threadsafe.
  * \return The pipeline handler name
+ */
+
+/**
+ * \fn PipelineHandler::useCount()
+ * \brief Retrieve the pipeline handler's used camera count
+ * \return The number of acquired cameras of the pipeline handler
+ */
+
+/**
+ * \fn PipelineHandler::cameraManager() const
+ * \brief Retrieve the CameraManager that this pipeline handler belongs to
+ * \context This function is \threadsafe.
+ * \return The CameraManager for this pipeline handler
  */
 
 /**

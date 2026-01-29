@@ -10,6 +10,7 @@
 #include <memory>
 #include <optional>
 #include <ostream>
+#include <stdint.h>
 #include <string>
 #include <vector>
 
@@ -65,7 +66,7 @@ struct V4L2SubdeviceFormat {
 	Size size;
 	std::optional<ColorSpace> colorSpace;
 
-	const std::string toString() const;
+	std::string toString() const;
 };
 
 std::ostream &operator<<(std::ostream &out, const V4L2SubdeviceFormat &f);
@@ -175,6 +176,9 @@ private:
 	std::vector<unsigned int> enumPadCodes(const Stream &stream);
 	std::vector<SizeRange> enumPadSizes(const Stream &stream,
 					    unsigned int code);
+
+	int getRoutingLegacy(Routing *routing, Whence whence);
+	int setRoutingLegacy(Routing *routing, Whence whence);
 
 	const MediaEntity *entity_;
 

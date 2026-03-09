@@ -1,3 +1,9 @@
+libcamera (0.6.0-2deepin1) unstable; urgency=medium
+
+  * add libabsl-dev in build-depends. 
+
+ -- tunaichao <tunaichao@uniontech.com>  Mon, 09 Mar 2026 17:41:52 +0800
+
 libcamera (0.6.0-2) unstable; urgency=medium
 
   * Upload to unstable.

@@ -51,7 +51,6 @@ Q_SIGNALS:
 protected:
 	void initializeGL() override;
 	void paintGL() override;
-	void resizeGL(int w, int h) override;
 	QSize sizeHint() const override;
 
 private:
@@ -88,6 +87,7 @@ private:
 
 	/* Common texture parameters */
 	GLuint textureMinMagFilters_;
+	GLuint projMatrixUniform_;
 
 	/* YUV texture parameters */
 	GLuint textureUniformU_;
@@ -102,6 +102,18 @@ private:
 	GLuint textureUniformStrideFactor_;
 	GLuint textureUniformBayerFirstRed_;
 	QPointF firstRed_;
+
+	/* Represent per-frame CCM as a uniform vector of floats 3 x 3 */
+	GLint ccmUniformDataIn_;
+
+	/* Black Level compensation */
+	GLint blackLevelUniformDataIn_;
+
+	/* Gamma */
+	GLint gammaUniformDataIn_;
+
+	/* Contrast */
+	GLint contrastExpUniformDataIn_;
 
 	QMutex mutex_; /* Prevent concurrent access to image_ */
 };

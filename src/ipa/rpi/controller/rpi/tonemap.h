@@ -2,12 +2,13 @@
 /*
  * Copyright (C) 2022, Raspberry Pi Ltd
  *
- * tonemap.hpp - Tonemap control algorithm
+ * Tonemap control algorithm
  */
 #pragma once
 
+#include <libipa/pwl.h>
+
 #include "algorithm.h"
-#include "pwl.h"
 
 namespace RPiController {
 
@@ -16,7 +17,7 @@ struct TonemapConfig {
 	double detailSlope;
 	double iirStrength;
 	double strength;
-	Pwl tonemap;
+	libcamera::ipa::Pwl tonemap;
 };
 
 class Tonemap : public Algorithm

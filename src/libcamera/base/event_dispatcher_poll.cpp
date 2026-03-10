@@ -7,14 +7,13 @@
 
 #include <libcamera/base/event_dispatcher_poll.h>
 
-#include <algorithm>
-#include <chrono>
 #include <iomanip>
 #include <poll.h>
 #include <stdint.h>
 #include <string.h>
 #include <sys/eventfd.h>
 #include <unistd.h>
+#include <vector>
 
 #include <libcamera/base/event_notifier.h>
 #include <libcamera/base/log.h>
@@ -245,9 +244,9 @@ void EventDispatcherPoll::processNotifiers(const std::vector<struct pollfd> &pol
 		EventNotifier::Type type;
 		short events;
 	} events[] = {
+		{ EventNotifier::Exception, POLLPRI },
 		{ EventNotifier::Read, POLLIN },
 		{ EventNotifier::Write, POLLOUT },
-		{ EventNotifier::Exception, POLLPRI },
 	};
 
 	processingEvents_ = true;

@@ -82,6 +82,16 @@ public:
 		 * to be applied after ISP processing.
 		 */
 		Needs32bitConv	= (1 << 4),
+		/*
+		 * Indicates that the input stream needs a software 16-bit endian
+		 * conversion to be applied before ISP processing.
+		 */
+		Needs16bitEndianSwap = (1 << 5),
+		/*
+		 * Indicates that the input stream needs a software 14-bit to
+		 * 16-bit unpacking.
+		 */
+		Needs14bitUnpack = (1 << 6),
 	};
 
 	using StreamFlags = Flags<StreamFlag>;
@@ -115,7 +125,7 @@ public:
 
 	void setExportedBuffer(FrameBuffer *buffer);
 
-	int prepareBuffers(unsigned int count);
+	int allocateBuffers(unsigned int count);
 	int queueBuffer(FrameBuffer *buffer);
 	void returnBuffer(FrameBuffer *buffer);
 
@@ -130,7 +140,6 @@ public:
 
 private:
 	void bufferEmplace(unsigned int id, FrameBuffer *buffer);
-	void clearBuffers();
 	int queueToDevice(FrameBuffer *buffer);
 
 	StreamFlags flags_;

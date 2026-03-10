@@ -76,6 +76,21 @@ int DeviceEnumeratorUdev::addUdevDevice(struct udev_device *dev)
 	if (!subsystem)
 		return -ENODEV;
 
+	/*
+	 * Record that udev reported the given devnum. And reject if it has
+	 * already been seen (e.g. device added between udev monitor creation
+	 * in `init()` and `enumerate()`). This record is kept even if later
+	 * in this function an error is encountered. Only a "remove" event
+	 * from udev should erase it from `devices_`.
+	 */
+	const dev_t devnum = udev_device_get_devnum(dev);
+	if (devnum == makedev(0, 0))
+		return -ENODEV;
+
+	const auto [it, inserted] = devices_.insert(devnum);
+	if (!inserted)
+		return -EEXIST;
+
 	if (!strcmp(subsystem, "media")) {
 		std::unique_ptr<MediaDevice> media =
 			createDevice(udev_device_get_devnode(dev));
@@ -111,11 +126,20 @@ int DeviceEnumeratorUdev::addUdevDevice(struct udev_device *dev)
 	}
 
 	if (!strcmp(subsystem, "video4linux")) {
-		addV4L2Device(udev_device_get_devnum(dev));
+		addV4L2Device(devnum);
 		return 0;
 	}
 
 	return -ENODEV;
+}
+
+void DeviceEnumeratorUdev::removeUdevDevice(struct udev_device *dev)
+{
+	const char *subsystem = udev_device_get_subsystem(dev);
+	if (subsystem && !strcmp(subsystem, "media"))
+		removeDevice(udev_device_get_devnode(dev));
+
+	devices_.erase(udev_device_get_devnum(dev));
 }
 
 int DeviceEnumeratorUdev::enumerate()
@@ -332,19 +356,23 @@ int DeviceEnumeratorUdev::addV4L2Device(dev_t devnum)
 void DeviceEnumeratorUdev::udevNotify()
 {
 	struct udev_device *dev = udev_monitor_receive_device(monitor_);
+	if (!dev) {
+		int err = errno;
+		LOG(DeviceEnumerator, Warning)
+			<< "Ignoring notfication received without a device: "
+			<< strerror(err);
+		return;
+	}
+
 	std::string_view action(udev_device_get_action(dev));
-	std::string_view deviceNode(udev_device_get_devnode(dev));
 
 	LOG(DeviceEnumerator, Debug)
-		<< action << " device " << deviceNode;
+		<< action << " device " << udev_device_get_devnode(dev);
 
-	if (action == "add") {
+	if (action == "add")
 		addUdevDevice(dev);
-	} else if (action == "remove") {
-		const char *subsystem = udev_device_get_subsystem(dev);
-		if (subsystem && !strcmp(subsystem, "media"))
-			removeDevice(std::string(deviceNode));
-	}
+	else if (action == "remove")
+		removeUdevDevice(dev);
 
 	udev_device_unref(dev);
 }

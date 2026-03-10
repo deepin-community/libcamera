@@ -30,7 +30,8 @@ override_dh_auto_configure:
 		-Dqcam=$(QCAM) \
 		-Dtest=true \
 		$(CONFFLAGS) \
-		$(empty)
+		$(empty) \
+		-Ddocumentation=disabled
 
 # Only make the tests fail for key architectures
 override_dh_auto_test:

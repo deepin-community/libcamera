@@ -1,3 +1,9 @@
+libcamera (0.7.0-2deepin1) unstable; urgency=medium
+
+  * Disable documentation
+
+ -- zhaochengyi <zhaochengyi@uniontech.com>  Tue, 10 Mar 2026 17:05:07 +0800
+
 libcamera (0.7.0-2) unstable; urgency=medium
 
   * Upload to unstable.

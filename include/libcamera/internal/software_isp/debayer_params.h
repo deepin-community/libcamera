@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 /*
- * Copyright (C) 2023, Red Hat Inc.
+ * Copyright (C) 2023-2026 Red Hat Inc.
  *
  * Authors:
  * Hans de Goede <hdegoede@redhat.com>
@@ -10,20 +10,19 @@
 
 #pragma once
 
+#include <stdint.h>
+
+#include "libcamera/internal/matrix.h"
+#include "libcamera/internal/vector.h"
+
 namespace libcamera {
 
 struct DebayerParams {
-	static constexpr unsigned int kGain10 = 256;
-
-	unsigned int gainR;
-	unsigned int gainG;
-	unsigned int gainB;
-
+	Matrix<float, 3, 3> combinedMatrix;
+	RGB<float> blackLevel;
 	float gamma;
-	/**
-	 * \brief Level of the black point, 0..255, 0 is no correction.
-	 */
-	unsigned int blackLevel;
+	float contrastExp;
+	RGB<float> gains;
 };
 
 } /* namespace libcamera */

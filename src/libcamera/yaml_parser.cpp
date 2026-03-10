@@ -7,10 +7,11 @@
 
 #include "libcamera/internal/yaml_parser.h"
 
-#include <cstdlib>
+#include <charconv>
 #include <errno.h>
 #include <functional>
 #include <limits>
+#include <stdlib.h>
 
 #include <libcamera/base/file.h>
 #include <libcamera/base/log.h>
@@ -18,7 +19,7 @@
 #include <yaml.h>
 
 /**
- * \file libcamera/internal/yaml_parser.h
+ * \file yaml_parser.h
  * \brief A YAML parser helper
  */
 
@@ -38,12 +39,12 @@ static const YamlObject empty;
  * \brief A class representing the tree structure of the YAML content
  *
  * The YamlObject class represents the tree structure of YAML content. A
- * YamlObject can be a dictionary or list of YamlObjects or a value if a tree
- * leaf.
+ * YamlObject can be empty, a dictionary or list of YamlObjects, or a value if a
+ * tree leaf.
  */
 
 YamlObject::YamlObject()
-	: type_(Type::Value)
+	: type_(Type::Empty)
 {
 }
 
@@ -68,6 +69,20 @@ YamlObject::~YamlObject() = default;
  * \brief Return whether the YamlObject is a dictionary
  *
  * \return True if the YamlObject is a dictionary, false otherwise
+ */
+
+/**
+ * \fn YamlObject::isEmpty()
+ * \brief Return whether the YamlObject is an empty
+ *
+ * \return True if the YamlObject is empty, false otherwise
+ */
+
+/**
+ * \fn YamlObject::operator bool()
+ * \brief Return whether the YamlObject is a non-empty
+ *
+ * \return False if the YamlObject is empty, true otherwise
  */
 
 /**
@@ -104,7 +119,7 @@ std::size_t YamlObject::size() const
  */
 
 /**
- * \fn template<typename T> YamlObject::get<T>(const T &defaultValue) const
+ * \fn template<typename T, typename U> YamlObject::get<T>(U &&defaultValue) const
  * \brief Parse the YamlObject as a \a T value
  * \param[in] defaultValue The default value when failing to parse
  *
@@ -118,172 +133,74 @@ std::size_t YamlObject::size() const
 #ifndef __DOXYGEN__
 
 template<>
-std::optional<bool> YamlObject::get() const
+std::optional<bool>
+YamlObject::Getter<bool>::get(const YamlObject &obj) const
 {
-	if (type_ != Type::Value)
+	if (obj.type_ != Type::Value)
 		return std::nullopt;
 
-	if (value_ == "true")
+	if (obj.value_ == "true")
 		return true;
-	else if (value_ == "false")
+	else if (obj.value_ == "false")
 		return false;
 
 	return std::nullopt;
 }
 
-namespace {
-
-bool parseSignedInteger(const std::string &str, long min, long max,
-			long *result)
+template<typename T>
+struct YamlObject::Getter<T, std::enable_if_t<
+	std::is_same_v<int8_t, T> ||
+	std::is_same_v<uint8_t, T> ||
+	std::is_same_v<int16_t, T> ||
+	std::is_same_v<uint16_t, T> ||
+	std::is_same_v<int32_t, T> ||
+	std::is_same_v<uint32_t, T>>>
 {
-	if (str == "")
-		return false;
+	std::optional<T> get(const YamlObject &obj) const
+	{
+		if (obj.type_ != Type::Value)
+			return std::nullopt;
 
-	char *end;
+		const std::string &str = obj.value_;
+		T value = {};
 
-	errno = 0;
-	long value = std::strtol(str.c_str(), &end, 10);
+		auto [ptr, ec] = std::from_chars(str.data(), str.data() + str.size(),
+						 value);
+		if (ptr != str.data() + str.size() || ec != std::errc())
+			return std::nullopt;
 
-	if ('\0' != *end || errno == ERANGE || value < min || value > max)
-		return false;
+		return value;
+	}
+};
 
-	*result = value;
-	return true;
-}
-
-bool parseUnsignedInteger(const std::string &str, unsigned long max,
-			  unsigned long *result)
-{
-	if (str == "")
-		return false;
-
-	/*
-	 * strtoul() accepts strings representing a negative number, in which
-	 * case it negates the converted value. We don't want to silently accept
-	 * negative values and return a large positive number, so check for a
-	 * minus sign (after optional whitespace) and return an error.
-	 */
-	std::size_t found = str.find_first_not_of(" \t");
-	if (found != std::string::npos && str[found] == '-')
-		return false;
-
-	char *end;
-
-	errno = 0;
-	unsigned long value = std::strtoul(str.c_str(), &end, 10);
-
-	if ('\0' != *end || errno == ERANGE || value > max)
-		return false;
-
-	*result = value;
-	return true;
-}
-
-} /* namespace */
+template struct YamlObject::Getter<int8_t>;
+template struct YamlObject::Getter<uint8_t>;
+template struct YamlObject::Getter<int16_t>;
+template struct YamlObject::Getter<uint16_t>;
+template struct YamlObject::Getter<int32_t>;
+template struct YamlObject::Getter<uint32_t>;
 
 template<>
-std::optional<int8_t> YamlObject::get() const
+std::optional<float>
+YamlObject::Getter<float>::get(const YamlObject &obj) const
 {
-	if (type_ != Type::Value)
-		return std::nullopt;
-
-	long value;
-
-	if (!parseSignedInteger(value_, std::numeric_limits<int8_t>::min(),
-				std::numeric_limits<int8_t>::max(), &value))
-		return std::nullopt;
-
-	return value;
+	return obj.get<double>();
 }
 
 template<>
-std::optional<uint8_t> YamlObject::get() const
+std::optional<double>
+YamlObject::Getter<double>::get(const YamlObject &obj) const
 {
-	if (type_ != Type::Value)
+	if (obj.type_ != Type::Value)
 		return std::nullopt;
 
-	unsigned long value;
-
-	if (!parseUnsignedInteger(value_, std::numeric_limits<uint8_t>::max(),
-				  &value))
-		return std::nullopt;
-
-	return value;
-}
-
-template<>
-std::optional<int16_t> YamlObject::get() const
-{
-	if (type_ != Type::Value)
-		return std::nullopt;
-
-	long value;
-
-	if (!parseSignedInteger(value_, std::numeric_limits<int16_t>::min(),
-				std::numeric_limits<int16_t>::max(), &value))
-		return std::nullopt;
-
-	return value;
-}
-
-template<>
-std::optional<uint16_t> YamlObject::get() const
-{
-	if (type_ != Type::Value)
-		return std::nullopt;
-
-	unsigned long value;
-
-	if (!parseUnsignedInteger(value_, std::numeric_limits<uint16_t>::max(),
-				  &value))
-		return std::nullopt;
-
-	return value;
-}
-
-template<>
-std::optional<int32_t> YamlObject::get() const
-{
-	if (type_ != Type::Value)
-		return std::nullopt;
-
-	long value;
-
-	if (!parseSignedInteger(value_, std::numeric_limits<int32_t>::min(),
-				std::numeric_limits<int32_t>::max(), &value))
-		return std::nullopt;
-
-	return value;
-}
-
-template<>
-std::optional<uint32_t> YamlObject::get() const
-{
-	if (type_ != Type::Value)
-		return std::nullopt;
-
-	unsigned long value;
-
-	if (!parseUnsignedInteger(value_, std::numeric_limits<uint32_t>::max(),
-				  &value))
-		return std::nullopt;
-
-	return value;
-}
-
-template<>
-std::optional<double> YamlObject::get() const
-{
-	if (type_ != Type::Value)
-		return std::nullopt;
-
-	if (value_ == "")
+	if (obj.value_.empty())
 		return std::nullopt;
 
 	char *end;
 
 	errno = 0;
-	double value = utils::strtod(value_.c_str(), &end);
+	double value = utils::strtod(obj.value_.c_str(), &end);
 
 	if ('\0' != *end || errno == ERANGE)
 		return std::nullopt;
@@ -292,28 +209,30 @@ std::optional<double> YamlObject::get() const
 }
 
 template<>
-std::optional<std::string> YamlObject::get() const
+std::optional<std::string>
+YamlObject::Getter<std::string>::get(const YamlObject &obj) const
 {
-	if (type_ != Type::Value)
+	if (obj.type_ != Type::Value)
 		return std::nullopt;
 
-	return value_;
+	return obj.value_;
 }
 
 template<>
-std::optional<Size> YamlObject::get() const
+std::optional<Size>
+YamlObject::Getter<Size>::get(const YamlObject &obj) const
 {
-	if (type_ != Type::List)
+	if (obj.type_ != Type::List)
 		return std::nullopt;
 
-	if (list_.size() != 2)
+	if (obj.list_.size() != 2)
 		return std::nullopt;
 
-	auto width = list_[0].value->get<uint32_t>();
+	auto width = obj.list_[0].value->get<uint32_t>();
 	if (!width)
 		return std::nullopt;
 
-	auto height = list_[1].value->get<uint32_t>();
+	auto height = obj.list_[1].value->get<uint32_t>();
 	if (!height)
 		return std::nullopt;
 
@@ -339,6 +258,7 @@ std::optional<Size> YamlObject::get() const
 template<typename T,
 	 std::enable_if_t<
 		 std::is_same_v<bool, T> ||
+		 std::is_same_v<float, T> ||
 		 std::is_same_v<double, T> ||
 		 std::is_same_v<int8_t, T> ||
 		 std::is_same_v<uint8_t, T> ||
@@ -367,6 +287,7 @@ std::optional<std::vector<T>> YamlObject::getList() const
 }
 
 template std::optional<std::vector<bool>> YamlObject::getList<bool>() const;
+template std::optional<std::vector<float>> YamlObject::getList<float>() const;
 template std::optional<std::vector<double>> YamlObject::getList<double>() const;
 template std::optional<std::vector<int8_t>> YamlObject::getList<int8_t>() const;
 template std::optional<std::vector<uint8_t>> YamlObject::getList<uint8_t>() const;
@@ -424,7 +345,8 @@ template std::optional<std::vector<Size>> YamlObject::getList<Size>() const;
  *
  * This function retrieves an element of the YamlObject. Only YamlObject
  * instances of List type associate elements with index, calling this function
- * on other types of instances is invalid and results in undefined behaviour.
+ * on other types of instances or with an invalid index results in an empty
+ * object.
  *
  * \return The YamlObject as an element of the list
  */
@@ -447,31 +369,31 @@ const YamlObject &YamlObject::operator[](std::size_t index) const
  *
  * \return True if an element exists, false otherwise
  */
-bool YamlObject::contains(const std::string &key) const
+bool YamlObject::contains(std::string_view key) const
 {
-	if (dictionary_.find(std::ref(key)) == dictionary_.end())
-		return false;
-
-	return true;
+	return dictionary_.find(key) != dictionary_.end();
 }
 
 /**
- * \fn YamlObject::operator[](const std::string &key) const
+ * \fn YamlObject::operator[](std::string_view key) const
  * \brief Retrieve a member by name from the dictionary
  *
  * This function retrieve a member of a YamlObject by name. Only YamlObject
  * instances of Dictionary type associate elements with names, calling this
- * function on other types of instances is invalid and results in undefined
- * behaviour.
+ * function on other types of instances or with a nonexistent key results in an
+ * empty object.
  *
  * \return The YamlObject corresponding to the \a key member
  */
-const YamlObject &YamlObject::operator[](const std::string &key) const
+const YamlObject &YamlObject::operator[](std::string_view key) const
 {
-	if (type_ != Type::Dictionary || !contains(key))
+	if (type_ != Type::Dictionary)
 		return empty;
 
 	auto iter = dictionary_.find(key);
+	if (iter == dictionary_.end())
+		return empty;
+
 	return *iter->second;
 }
 
@@ -587,8 +509,17 @@ YamlParserContext::EventPtr YamlParserContext::nextEvent()
 	EventPtr event(new yaml_event_t);
 
 	/* yaml_parser_parse returns 1 when it succeeds */
-	if (!yaml_parser_parse(&parser_, event.get()))
+	if (!yaml_parser_parse(&parser_, event.get())) {
+		File *file = static_cast<File *>(parser_.read_handler_data);
+
+		LOG(YamlParser, Error) << file->fileName() << ":"
+				       << parser_.problem_mark.line << ":"
+				       << parser_.problem_mark.column << " "
+				       << parser_.problem << " "
+				       << parser_.context;
+
 		return nullptr;
+	}
 
 	return event;
 }

@@ -8,8 +8,6 @@
 #include "libcamera/internal/v4l2_subdevice.h"
 
 #include <fcntl.h>
-#include <iomanip>
-#include <regex>
 #include <sstream>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -18,10 +16,11 @@
 #include <linux/media-bus-format.h>
 #include <linux/v4l2-subdev.h>
 
-#include <libcamera/geometry.h>
-
 #include <libcamera/base/log.h>
+#include <libcamera/base/regex.h>
 #include <libcamera/base/utils.h>
+
+#include <libcamera/geometry.h>
 
 #include "libcamera/internal/formats.h"
 #include "libcamera/internal/media_device.h"
@@ -187,6 +186,20 @@ const std::map<uint32_t, MediaBusFormatInfo> mediaBusFormatInfo{
 		.code = MEDIA_BUS_FMT_RGB888_2X12_LE,
 		.type = MediaBusFormatInfo::Type::Image,
 		.bitsPerPixel = 24,
+		.colourEncoding = PixelFormatInfo::ColourEncodingRGB,
+	} },
+	{ MEDIA_BUS_FMT_RGB121212_1X36, {
+		.name = "RGB121212_1X36",
+		.code = MEDIA_BUS_FMT_RGB121212_1X36,
+		.type = MediaBusFormatInfo::Type::Image,
+		.bitsPerPixel = 36,
+		.colourEncoding = PixelFormatInfo::ColourEncodingRGB,
+	} },
+	{ MEDIA_BUS_FMT_RGB202020_1X60, {
+		.name = "RGB202020_1X60",
+		.code = MEDIA_BUS_FMT_RGB202020_1X60,
+		.type = MediaBusFormatInfo::Type::Image,
+		.bitsPerPixel = 60,
 		.colourEncoding = PixelFormatInfo::ColourEncodingRGB,
 	} },
 	{ MEDIA_BUS_FMT_ARGB8888_1X32, {
@@ -679,6 +692,34 @@ const std::map<uint32_t, MediaBusFormatInfo> mediaBusFormatInfo{
 		.bitsPerPixel = 16,
 		.colourEncoding = PixelFormatInfo::ColourEncodingRAW
 	} },
+	{ MEDIA_BUS_FMT_SBGGR20_1X20, {
+		.name = "SBGGR20_1X20",
+		.code = MEDIA_BUS_FMT_SBGGR20_1X20,
+		.type = MediaBusFormatInfo::Type::Image,
+		.bitsPerPixel = 20,
+		.colourEncoding = PixelFormatInfo::ColourEncodingRAW
+	} },
+	{ MEDIA_BUS_FMT_SGBRG20_1X20, {
+		.name = "SGBRG20_1X20",
+		.code = MEDIA_BUS_FMT_SGBRG20_1X20,
+		.type = MediaBusFormatInfo::Type::Image,
+		.bitsPerPixel = 20,
+		.colourEncoding = PixelFormatInfo::ColourEncodingRAW
+	} },
+	{ MEDIA_BUS_FMT_SGRBG20_1X20, {
+		.name = "SGRBG20_1X20",
+		.code = MEDIA_BUS_FMT_SGRBG20_1X20,
+		.type = MediaBusFormatInfo::Type::Image,
+		.bitsPerPixel = 20,
+		.colourEncoding = PixelFormatInfo::ColourEncodingRAW
+	} },
+	{ MEDIA_BUS_FMT_SRGGB20_1X20, {
+		.name = "SRGGB20_1X20",
+		.code = MEDIA_BUS_FMT_SRGGB20_1X20,
+		.type = MediaBusFormatInfo::Type::Image,
+		.bitsPerPixel = 20,
+		.colourEncoding = PixelFormatInfo::ColourEncodingRAW
+	} },
 	/* \todo Clarify colour encoding for HSV formats */
 	{ MEDIA_BUS_FMT_AHSV8888_1X32, {
 		.name = "AHSV8888_1X32",
@@ -698,6 +739,69 @@ const std::map<uint32_t, MediaBusFormatInfo> mediaBusFormatInfo{
 		.name = "METADATA_FIXED",
 		.code = MEDIA_BUS_FMT_METADATA_FIXED,
 		.type = MediaBusFormatInfo::Type::Metadata,
+		.bitsPerPixel = 0,
+		.colourEncoding = PixelFormatInfo::ColourEncodingRAW,
+	} },
+	{ MEDIA_BUS_FMT_META_8, {
+		.name = "META_8",
+		.code = MEDIA_BUS_FMT_META_8,
+		.type = MediaBusFormatInfo::Type::Metadata,
+		.bitsPerPixel = 8,
+		.colourEncoding = PixelFormatInfo::ColourEncodingRAW,
+	} },
+	{ MEDIA_BUS_FMT_META_10, {
+		.name = "META_10",
+		.code = MEDIA_BUS_FMT_META_10,
+		.type = MediaBusFormatInfo::Type::Metadata,
+		.bitsPerPixel = 10,
+		.colourEncoding = PixelFormatInfo::ColourEncodingRAW,
+	} },
+	{ MEDIA_BUS_FMT_META_12, {
+		.name = "META_12",
+		.code = MEDIA_BUS_FMT_META_12,
+		.type = MediaBusFormatInfo::Type::Metadata,
+		.bitsPerPixel = 12,
+		.colourEncoding = PixelFormatInfo::ColourEncodingRAW,
+	} },
+	{ MEDIA_BUS_FMT_META_14, {
+		.name = "META_14",
+		.code = MEDIA_BUS_FMT_META_14,
+		.type = MediaBusFormatInfo::Type::Metadata,
+		.bitsPerPixel = 14,
+		.colourEncoding = PixelFormatInfo::ColourEncodingRAW,
+	} },
+	{ MEDIA_BUS_FMT_META_16, {
+		.name = "META_16",
+		.code = MEDIA_BUS_FMT_META_16,
+		.type = MediaBusFormatInfo::Type::Metadata,
+		.bitsPerPixel = 16,
+		.colourEncoding = PixelFormatInfo::ColourEncodingRAW,
+	} },
+	{ MEDIA_BUS_FMT_META_20, {
+		.name = "META_20",
+		.code = MEDIA_BUS_FMT_META_20,
+		.type = MediaBusFormatInfo::Type::Metadata,
+		.bitsPerPixel = 20,
+		.colourEncoding = PixelFormatInfo::ColourEncodingRAW,
+	} },
+	{ MEDIA_BUS_FMT_META_24, {
+		.name = "META_24",
+		.code = MEDIA_BUS_FMT_META_24,
+		.type = MediaBusFormatInfo::Type::Metadata,
+		.bitsPerPixel = 24,
+		.colourEncoding = PixelFormatInfo::ColourEncodingRAW,
+	} },
+	{ MEDIA_BUS_FMT_CCS_EMBEDDED, {
+		.name = "CCS_EMBEDDED",
+		.code = MEDIA_BUS_FMT_CCS_EMBEDDED,
+		.type = MediaBusFormatInfo::Type::EmbeddedData,
+		.bitsPerPixel = 0,
+		.colourEncoding = PixelFormatInfo::ColourEncodingRAW,
+	} },
+	{ MEDIA_BUS_FMT_OV2740_EMBEDDED, {
+		.name = "OV2740_EMBEDDED",
+		.code = MEDIA_BUS_FMT_CCS_EMBEDDED,
+		.type = MediaBusFormatInfo::Type::EmbeddedData,
 		.bitsPerPixel = 0,
 		.colourEncoding = PixelFormatInfo::ColourEncodingRAW,
 	} },
@@ -813,7 +917,7 @@ const MediaBusFormatInfo &MediaBusFormatInfo::info(uint32_t code)
  * \brief Assemble and return a string describing the format
  * \return A string describing the V4L2SubdeviceFormat
  */
-const std::string V4L2SubdeviceFormat::toString() const
+std::string V4L2SubdeviceFormat::toString() const
 {
 	std::stringstream ss;
 	ss << *this;
@@ -838,6 +942,8 @@ std::ostream &operator<<(std::ostream &out, const V4L2SubdeviceFormat &f)
 		out << utils::hex(f.code, 4);
 	else
 		out << it->second.name;
+
+	out << "/" << ColorSpace::toString(f.colorSpace);
 
 	return out;
 }
@@ -1366,7 +1472,61 @@ void routeToKernel(const V4L2Subdevice::Route &route,
 	kroute.flags = route.flags;
 }
 
+/*
+ * Legacy routing support for pre-v6.10-rc1 kernels. Drop when v6.12-rc1 gets
+ * released.
+ */
+struct v4l2_subdev_routing_legacy {
+	__u32 which;
+	__u32 num_routes;
+	__u64 routes;
+	__u32 reserved[6];
+};
+
+#define VIDIOC_SUBDEV_G_ROUTING_LEGACY	_IOWR('V', 38, struct v4l2_subdev_routing_legacy)
+#define VIDIOC_SUBDEV_S_ROUTING_LEGACY	_IOWR('V', 39, struct v4l2_subdev_routing_legacy)
+
 } /* namespace */
+
+int V4L2Subdevice::getRoutingLegacy(Routing *routing, Whence whence)
+{
+	struct v4l2_subdev_routing_legacy rt = {};
+
+	rt.which = whence;
+
+	int ret = ioctl(VIDIOC_SUBDEV_G_ROUTING_LEGACY, &rt);
+	if (ret == 0 || ret == -ENOTTY)
+		return ret;
+
+	if (ret != -ENOSPC) {
+		LOG(V4L2, Error)
+			<< "Failed to retrieve number of routes: "
+			<< strerror(-ret);
+		return ret;
+	}
+
+	std::vector<struct v4l2_subdev_route> routes{ rt.num_routes };
+	rt.routes = reinterpret_cast<uintptr_t>(routes.data());
+
+	ret = ioctl(VIDIOC_SUBDEV_G_ROUTING_LEGACY, &rt);
+	if (ret) {
+		LOG(V4L2, Error)
+			<< "Failed to retrieve routes: " << strerror(-ret);
+		return ret;
+	}
+
+	if (rt.num_routes != routes.size()) {
+		LOG(V4L2, Error) << "Invalid number of routes";
+		return -EINVAL;
+	}
+
+	routing->resize(rt.num_routes);
+
+	for (const auto &[i, route] : utils::enumerate(routes))
+		routeFromKernel((*routing)[i], route);
+
+	return 0;
+}
 
 /**
  * \brief Retrieve the subdevice's internal routing table
@@ -1388,18 +1548,24 @@ int V4L2Subdevice::getRouting(Routing *routing, Whence whence)
 	rt.which = whence;
 
 	int ret = ioctl(VIDIOC_SUBDEV_G_ROUTING, &rt);
-	if (ret == 0 || ret == -ENOTTY)
-		return ret;
+	if (ret == -ENOTTY)
+		return V4L2Subdevice::getRoutingLegacy(routing, whence);
 
-	if (ret != -ENOSPC) {
+	if (ret) {
 		LOG(V4L2, Error)
 			<< "Failed to retrieve number of routes: "
 			<< strerror(-ret);
 		return ret;
 	}
 
+	if (!rt.num_routes)
+		return 0;
+
 	std::vector<struct v4l2_subdev_route> routes{ rt.num_routes };
 	rt.routes = reinterpret_cast<uintptr_t>(routes.data());
+
+	rt.len_routes = rt.num_routes;
+	rt.num_routes = 0;
 
 	ret = ioctl(VIDIOC_SUBDEV_G_ROUTING, &rt);
 	if (ret) {
@@ -1413,6 +1579,33 @@ int V4L2Subdevice::getRouting(Routing *routing, Whence whence)
 		return -EINVAL;
 	}
 
+	routing->resize(rt.num_routes);
+
+	for (const auto &[i, route] : utils::enumerate(routes))
+		routeFromKernel((*routing)[i], route);
+
+	return 0;
+}
+
+int V4L2Subdevice::setRoutingLegacy(Routing *routing, Whence whence)
+{
+	std::vector<struct v4l2_subdev_route> routes{ routing->size() };
+
+	for (const auto &[i, route] : utils::enumerate(*routing))
+		routeToKernel(route, routes[i]);
+
+	struct v4l2_subdev_routing_legacy rt = {};
+	rt.which = whence;
+	rt.num_routes = routes.size();
+	rt.routes = reinterpret_cast<uintptr_t>(routes.data());
+
+	int ret = ioctl(VIDIOC_SUBDEV_S_ROUTING_LEGACY, &rt);
+	if (ret) {
+		LOG(V4L2, Error) << "Failed to set routes: " << strerror(-ret);
+		return ret;
+	}
+
+	routes.resize(rt.num_routes);
 	routing->resize(rt.num_routes);
 
 	for (const auto &[i, route] : utils::enumerate(routes))
@@ -1447,16 +1640,43 @@ int V4L2Subdevice::setRouting(Routing *routing, Whence whence)
 
 	struct v4l2_subdev_routing rt = {};
 	rt.which = whence;
+	rt.len_routes = routes.size();
 	rt.num_routes = routes.size();
 	rt.routes = reinterpret_cast<uintptr_t>(routes.data());
 
 	int ret = ioctl(VIDIOC_SUBDEV_S_ROUTING, &rt);
+	if (ret == -ENOTTY)
+		return setRoutingLegacy(routing, whence);
+
 	if (ret) {
 		LOG(V4L2, Error) << "Failed to set routes: " << strerror(-ret);
 		return ret;
 	}
 
-	routes.resize(rt.num_routes);
+	/*
+	 * The kernel may want to return more routes than we have space for. In
+	 * that event, we must issue a VIDIOC_SUBDEV_G_ROUTING call to retrieve
+	 * the additional routes.
+	 */
+	if (rt.num_routes > routes.size()) {
+		routes.resize(rt.num_routes);
+
+		rt.len_routes = rt.num_routes;
+		rt.num_routes = 0;
+
+		ret = ioctl(VIDIOC_SUBDEV_G_ROUTING, &rt);
+		if (ret) {
+			LOG(V4L2, Error)
+				<< "Failed to retrieve routes: " << strerror(-ret);
+			return ret;
+		}
+	}
+
+	if (rt.num_routes != routes.size()) {
+		LOG(V4L2, Error) << "Invalid number of routes";
+		return -EINVAL;
+	}
+
 	routing->resize(rt.num_routes);
 
 	for (const auto &[i, route] : utils::enumerate(routes))
@@ -1504,11 +1724,10 @@ const std::string &V4L2Subdevice::model()
 	 * part of the entity name before the first space if the name contains
 	 * an I2C address, and use the full entity name otherwise.
 	 */
-	std::string entityName = entity_->name();
-	std::regex i2cRegex{ " [0-9]+-[0-9a-f]{4}" };
+	const std::string &entityName = entity_->name();
+	static const std::regex i2cRegex{ " [0-9]+-[0-9a-f]{4}" };
 	std::smatch match;
 
-	std::string model;
 	if (std::regex_search(entityName, match, i2cRegex))
 		model_ = entityName.substr(0, entityName.find(' '));
 	else
@@ -1528,12 +1747,29 @@ const std::string &V4L2Subdevice::model()
  * \a media
  * \param[in] media The media device where the entity is registered
  * \param[in] entity The media entity name
- *
  * \return A newly created V4L2Subdevice on success, nullptr otherwise
  */
 std::unique_ptr<V4L2Subdevice>
 V4L2Subdevice::fromEntityName(const MediaDevice *media,
 			      const std::string &entity)
+{
+	MediaEntity *mediaEntity = media->getEntityByName(entity);
+	if (!mediaEntity)
+		return nullptr;
+
+	return std::make_unique<V4L2Subdevice>(mediaEntity);
+}
+
+/**
+ * \brief Create a new video subdevice instance from an entity in media device
+ * \a media
+ * \param[in] media The media device where the entity is registered
+ * \param[in] entity A regex that will match the media entity's name
+ * \return A newly created V4L2Subdevice on success, nullptr otherwise
+ */
+std::unique_ptr<V4L2Subdevice>
+V4L2Subdevice::fromEntityName(const MediaDevice *media,
+			      const std::regex &entity)
 {
 	MediaEntity *mediaEntity = media->getEntityByName(entity);
 	if (!mediaEntity)

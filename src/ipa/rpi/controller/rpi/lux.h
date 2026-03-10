@@ -10,6 +10,7 @@
 
 #include <libcamera/base/utils.h>
 
+#include "../camera_mode.h"
 #include "../lux_status.h"
 #include "../algorithm.h"
 
@@ -23,6 +24,7 @@ public:
 	Lux(Controller *controller);
 	char const *name() const override;
 	int read(const libcamera::YamlObject &params) override;
+	void switchMode(CameraMode const &cameraMode, Metadata *metadata) override;
 	void prepare(Metadata *imageMetadata) override;
 	void process(StatisticsPtr &stats, Metadata *imageMetadata) override;
 	void setCurrentAperture(double aperture);
@@ -32,7 +34,7 @@ private:
 	 * These values define the conditions of the reference image, against
 	 * which we compare the new image.
 	 */
-	libcamera::utils::Duration referenceShutterSpeed_;
+	libcamera::utils::Duration referenceExposureTime_;
 	double referenceGain_;
 	double referenceAperture_; /* units of 1/f */
 	double referenceY_; /* out of 65536 */
@@ -40,6 +42,7 @@ private:
 	double currentAperture_;
 	LuxStatus status_;
 	std::mutex mutex_;
+	double sensitivity_;
 };
 
 } /* namespace RPiController */

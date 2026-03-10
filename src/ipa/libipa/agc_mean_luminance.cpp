@@ -7,6 +7,7 @@
 
 #include "agc_mean_luminance.h"
 
+#include <algorithm>
 #include <cmath>
 
 #include <libcamera/base/log.h>
@@ -44,6 +45,23 @@ static constexpr uint32_t kNumStartupFrames = 10;
  */
 static constexpr double kDefaultRelativeLuminanceTarget = 0.16;
 
+/*
+ * Maximum relative luminance target
+ *
+ * This value limits the relative luminance target after applying the exposure
+ * compensation. Targeting a value above this limit results in saturation
+ * and the inability to regulate properly.
+ */
+static constexpr double kMaxRelativeLuminanceTarget = 0.95;
+
+/*
+ * Default lux level
+ *
+ * If no lux level or a zero lux level is specified, but PWLs are used to
+ * specify luminance targets, this default level is used.
+ */
+static constexpr unsigned int kDefaultLuxLevel = 500;
+
 /**
  * \struct AgcMeanLuminance::AgcConstraint
  * \brief The boundaries and target for an AeConstraintMode constraint
@@ -59,9 +77,9 @@ static constexpr double kDefaultRelativeLuminanceTarget = 0.16;
 /**
  * \enum AgcMeanLuminance::AgcConstraint::Bound
  * \brief Specify whether the constraint defines a lower or upper bound
- * \var AgcMeanLuminance::AgcConstraint::lower
+ * \var AgcMeanLuminance::AgcConstraint::Lower
  * \brief The constraint defines a lower bound
- * \var AgcMeanLuminance::AgcConstraint::upper
+ * \var AgcMeanLuminance::AgcConstraint::Upper
  * \brief The constraint defines an upper bound
  */
 
@@ -89,10 +107,10 @@ static constexpr double kDefaultRelativeLuminanceTarget = 0.16;
  * \class AgcMeanLuminance
  * \brief A mean-based auto-exposure algorithm
  *
- * This algorithm calculates a shutter time, analogue and digital gain such that
- * the normalised mean luminance value of an image is driven towards a target,
- * which itself is discovered from tuning data. The algorithm is a two-stage
- * process.
+ * This algorithm calculates an exposure time, analogue and digital gain such
+ * that the normalised mean luminance value of an image is driven towards a
+ * target, which itself is discovered from tuning data. The algorithm is a
+ * two-stage process.
  *
  * In the first stage, an initial gain value is derived by iteratively comparing
  * the gain-adjusted mean luminance across the entire image against a target,
@@ -109,7 +127,7 @@ static constexpr double kDefaultRelativeLuminanceTarget = 0.16;
  * stage is then clamped to the gain from this stage.
  *
  * The final gain is used to adjust the effective exposure value of the image,
- * and that new exposure value is divided into shutter time, analogue gain and
+ * and that new exposure value is divided into exposure time, analogue gain and
  * digital gain according to the selected AeExposureMode. This class uses the
  * \ref ExposureModeHelper class to assist in that division, and expects the
  * data needed to initialise that class to be present in tuning data in a
@@ -134,19 +152,33 @@ static constexpr double kDefaultRelativeLuminanceTarget = 0.16;
  */
 
 AgcMeanLuminance::AgcMeanLuminance()
-	: frameCount_(0), filteredExposure_(0s), relativeLuminanceTarget_(0)
+	: filteredExposure_(0s), luxWarningEnabled_(true),
+	  exposureCompensation_(1.0), frameCount_(0), lux_(0)
 {
 }
 
 AgcMeanLuminance::~AgcMeanLuminance() = default;
 
-void AgcMeanLuminance::parseRelativeLuminanceTarget(const YamlObject &tuningData)
+int AgcMeanLuminance::parseRelativeLuminanceTarget(const YamlObject &tuningData)
 {
-	relativeLuminanceTarget_ =
-		tuningData["relativeLuminanceTarget"].get<double>(kDefaultRelativeLuminanceTarget);
+	auto &target = tuningData["relativeLuminanceTarget"];
+	if (!target) {
+		relativeLuminanceTarget_ = { { { { 0.0, kDefaultRelativeLuminanceTarget } } } };
+		return 0;
+	}
+
+	auto pwl = target.get<Pwl>();
+	if (!pwl) {
+		LOG(AgcMeanLuminance, Error)
+			<< "Failed to load relative luminance target.";
+		return -EINVAL;
+	}
+
+	relativeLuminanceTarget_ = std::move(*pwl);
+	return 0;
 }
 
-void AgcMeanLuminance::parseConstraint(const YamlObject &modeDict, int32_t id)
+int AgcMeanLuminance::parseConstraint(const YamlObject &modeDict, int32_t id)
 {
 	for (const auto &[boundName, content] : modeDict.asDict()) {
 		if (boundName != "upper" && boundName != "lower") {
@@ -159,10 +191,14 @@ void AgcMeanLuminance::parseConstraint(const YamlObject &modeDict, int32_t id)
 		AgcConstraint::Bound bound = static_cast<AgcConstraint::Bound>(idx);
 		double qLo = content["qLo"].get<double>().value_or(0.98);
 		double qHi = content["qHi"].get<double>().value_or(1.0);
-		double yTarget =
-			content["yTarget"].getList<double>().value_or(std::vector<double>{ 0.5 }).at(0);
+		auto yTarget = content["yTarget"].get<Pwl>();
+		if (!yTarget) {
+			LOG(AgcMeanLuminance, Error)
+				<< "Failed to parse yTarget";
+			return -EINVAL;
+		}
 
-		AgcConstraint constraint = { bound, qLo, qHi, yTarget };
+		AgcConstraint constraint = { bound, qLo, qHi, std::move(*yTarget) };
 
 		if (!constraintModes_.count(id))
 			constraintModes_[id] = {};
@@ -172,6 +208,8 @@ void AgcMeanLuminance::parseConstraint(const YamlObject &modeDict, int32_t id)
 		else
 			constraintModes_[id].insert(constraintModes_[id].begin(), constraint);
 	}
+
+	return 0;
 }
 
 int AgcMeanLuminance::parseConstraintModes(const YamlObject &tuningData)
@@ -194,8 +232,11 @@ int AgcMeanLuminance::parseConstraintModes(const YamlObject &tuningData)
 				return -EINVAL;
 			}
 
-			parseConstraint(modeDict,
-					AeConstraintModeNameValueMap.at(modeName));
+			int ret = parseConstraint(modeDict,
+						  AeConstraintModeNameValueMap.at(modeName));
+			if (ret)
+				return ret;
+
 			availableConstraintModes.push_back(
 				AeConstraintModeNameValueMap.at(modeName));
 		}
@@ -209,17 +250,16 @@ int AgcMeanLuminance::parseConstraintModes(const YamlObject &tuningData)
 	 */
 	if (constraintModes_.empty()) {
 		AgcConstraint constraint = {
-			AgcConstraint::Bound::lower,
+			AgcConstraint::Bound::Lower,
 			0.98,
 			1.0,
-			0.5
+			Pwl({ { { 0.0, 0.5 } } })
 		};
 
 		constraintModes_[controls::ConstraintNormal].insert(
 			constraintModes_[controls::ConstraintNormal].begin(),
 			constraint);
-		availableConstraintModes.push_back(
-			AeConstraintModeNameValueMap.at("ConstraintNormal"));
+		availableConstraintModes.push_back(controls::ConstraintNormal);
 	}
 
 	controls_[&controls::AeConstraintMode] = ControlInfo(availableConstraintModes);
@@ -247,27 +287,27 @@ int AgcMeanLuminance::parseExposureModes(const YamlObject &tuningData)
 				return -EINVAL;
 			}
 
-			std::vector<uint32_t> shutters =
-				modeValues["shutter"].getList<uint32_t>().value_or(std::vector<uint32_t>{});
+			std::vector<uint32_t> exposureTimes =
+				modeValues["exposureTime"].getList<uint32_t>().value_or(std::vector<uint32_t>{});
 			std::vector<double> gains =
 				modeValues["gain"].getList<double>().value_or(std::vector<double>{});
 
-			if (shutters.size() != gains.size()) {
+			if (exposureTimes.size() != gains.size()) {
 				LOG(AgcMeanLuminance, Error)
-					<< "Shutter and gain array sizes unequal";
+					<< "Exposure time and gain array sizes unequal";
 				return -EINVAL;
 			}
 
-			if (shutters.empty()) {
+			if (exposureTimes.empty()) {
 				LOG(AgcMeanLuminance, Error)
-					<< "Shutter and gain arrays are empty";
+					<< "Exposure time and gain arrays are empty";
 				return -EINVAL;
 			}
 
 			std::vector<std::pair<utils::Duration, double>> stages;
-			for (unsigned int i = 0; i < shutters.size(); i++) {
+			for (unsigned int i = 0; i < exposureTimes.size(); i++) {
 				stages.push_back({
-					std::chrono::microseconds(shutters[i]),
+					std::chrono::microseconds(exposureTimes[i]),
 					gains[i]
 				});
 			}
@@ -283,11 +323,11 @@ int AgcMeanLuminance::parseExposureModes(const YamlObject &tuningData)
 	/*
 	 * If we don't have any exposure modes in the tuning data we create an
 	 * ExposureModeHelper using an empty vector of stages. This will result
-	 * in the ExposureModeHelper simply driving the shutter as high as
+	 * in the ExposureModeHelper simply driving the exposure time as high as
 	 * possible before touching gain.
 	 */
 	if (availableExposureModes.empty()) {
-		int32_t exposureModeId = AeExposureModeNameValueMap.at("ExposureNormal");
+		int32_t exposureModeId = controls::ExposureNormal;
 		std::vector<std::pair<utils::Duration, double>> stages = { };
 
 		std::shared_ptr<ExposureModeHelper> helper =
@@ -303,6 +343,23 @@ int AgcMeanLuminance::parseExposureModes(const YamlObject &tuningData)
 }
 
 /**
+ * \brief Configure the exposure mode helpers
+ * \param[in] lineDuration The sensor line length
+ * \param[in] sensorHelper The sensor helper
+ *
+ * This function configures the exposure mode helpers so they can correctly
+ * take quantization effects into account.
+ */
+void AgcMeanLuminance::configure(utils::Duration lineDuration,
+				 const CameraSensorHelper *sensorHelper)
+{
+	for (auto &[id, helper] : exposureModeHelpers_)
+		helper->configure(lineDuration, sensorHelper);
+
+	luxWarningEnabled_ = true;
+}
+
+/**
  * \brief Parse tuning data for AeConstraintMode and AeExposureMode controls
  * \param[in] tuningData the YamlObject representing the tuning data
  *
@@ -311,8 +368,9 @@ int AgcMeanLuminance::parseExposureModes(const YamlObject &tuningData)
  * the data in a specific format; the Agc algorithm's tuning data should contain
  * a dictionary called AeConstraintMode containing per-mode setting dictionaries
  * with the key being a value from \ref controls::AeConstraintModeNameValueMap.
- * Each mode dict may contain either a "lower" or "upper" key or both, for
- * example:
+ * The yTarget can either be provided as single value or as array in which case
+ * it is interpreted as a PWL mapping lux levels to yTarget values. Each mode
+ * dict may contain either a "lower" or "upper" key or both, for example:
  *
  * \code{.unparsed}
  * algorithms:
@@ -331,25 +389,25 @@ int AgcMeanLuminance::parseExposureModes(const YamlObject &tuningData)
  *           upper:
  *             qLo: 0.98
  *             qHi: 1.0
- *             yTarget: 0.8
+ *             yTarget: [ 100, 0.8, 20000, 0.5 ]
  *
  * \endcode
  *
  * For the AeExposureMode control the data should contain a dictionary called
  * AeExposureMode containing per-mode setting dictionaries with the key being a
  * value from \ref controls::AeExposureModeNameValueMap. Each mode dict should
- * contain an array of shutter times with the key "shutter" and an array of gain
- * values with the key "gain", in this format:
+ * contain an array of exposure times with the key "exposureTime" and an array
+ * of gain values with the key "gain", in this format:
  *
  * \code{.unparsed}
  * algorithms:
  *   - Agc:
  *       AeExposureMode:
  *         ExposureNormal:
- *           shutter: [ 100, 10000, 30000, 60000, 120000 ]
+ *           exposureTime: [ 100, 10000, 30000, 60000, 120000 ]
  *           gain: [ 2.0, 4.0, 6.0, 8.0, 10.0 ]
  *         ExposureShort:
- *           shutter: [ 100, 10000, 30000, 60000, 120000 ]
+ *           exposureTime: [ 100, 10000, 30000, 60000, 120000 ]
  *           gain: [ 2.0, 4.0, 6.0, 8.0, 10.0 ]
  *
  * \endcode
@@ -360,7 +418,9 @@ int AgcMeanLuminance::parseTuningData(const YamlObject &tuningData)
 {
 	int ret;
 
-	parseRelativeLuminanceTarget(tuningData);
+	ret = parseRelativeLuminanceTarget(tuningData);
+	if (ret)
+		return ret;
 
 	ret = parseConstraintModes(tuningData);
 	if (ret)
@@ -370,21 +430,44 @@ int AgcMeanLuminance::parseTuningData(const YamlObject &tuningData)
 }
 
 /**
+ * \fn AgcMeanLuminance::setExposureCompensation()
+ * \brief Set the exposure compensation value
+ * \param[in] gain The exposure compensation gain
+ *
+ * This function sets the exposure compensation value to be used in the
+ * AGC calculations. It is expressed as gain instead of EV.
+ */
+
+/**
+ * \fn AgcMeanLuminance::setLux(int lux)
+ * \brief Set the lux level
+ * \param[in] lux The lux level
+ *
+ * This function sets the lux level to be used in the AGC calculations. A value
+ * of 0 means no measurement and a default value of \a kDefaultLuxLevel is used
+ * if necessary.
+ */
+
+/**
  * \brief Set the ExposureModeHelper limits for this class
- * \param[in] minShutter Minimum shutter time to allow
- * \param[in] maxShutter Maximum shutter time to allow
+ * \param[in] minExposureTime Minimum exposure time to allow
+ * \param[in] maxExposureTime Maximum ewposure time to allow
  * \param[in] minGain Minimum gain to allow
  * \param[in] maxGain Maximum gain to allow
+ * \param[in] constraints Additional constraints to apply
  *
  * This function calls \ref ExposureModeHelper::setLimits() for each
  * ExposureModeHelper that has been created for this class.
  */
-void AgcMeanLuminance::setLimits(utils::Duration minShutter,
-				 utils::Duration maxShutter,
-				 double minGain, double maxGain)
+void AgcMeanLuminance::setLimits(utils::Duration minExposureTime,
+				 utils::Duration maxExposureTime,
+				 double minGain, double maxGain,
+				 std::vector<AgcMeanLuminance::AgcConstraint> constraints)
 {
 	for (auto &[id, helper] : exposureModeHelpers_)
-		helper->setLimits(minShutter, maxShutter, minGain, maxGain);
+		helper->setLimits(minExposureTime, maxExposureTime, minGain, maxGain);
+
+	additionalConstraints_ = std::move(constraints);
 }
 
 /**
@@ -425,7 +508,7 @@ void AgcMeanLuminance::setLimits(utils::Duration minShutter,
  */
 double AgcMeanLuminance::estimateInitialGain() const
 {
-	double yTarget = relativeLuminanceTarget_;
+	double yTarget = effectiveYTarget();
 	double yGain = 1.0;
 
 	/*
@@ -462,21 +545,78 @@ double AgcMeanLuminance::constraintClampGain(uint32_t constraintModeIndex,
 					     const Histogram &hist,
 					     double gain)
 {
-	std::vector<AgcConstraint> &constraints = constraintModes_[constraintModeIndex];
-	for (const AgcConstraint &constraint : constraints) {
-		double newGain = constraint.yTarget * hist.bins() /
+	auto applyConstraint = [this, &gain, &hist](const AgcConstraint &constraint) {
+		double lux = lux_;
+
+		if (relativeLuminanceTarget_.size() > 1 && lux_ == 0)
+			lux = kDefaultLuxLevel;
+
+		double target = constraint.yTarget.eval(
+			constraint.yTarget.domain().clamp(lux));
+		double newGain = target * hist.bins() /
 				 hist.interQuantileMean(constraint.qLo, constraint.qHi);
 
-		if (constraint.bound == AgcConstraint::Bound::lower &&
-		    newGain > gain)
+		if (constraint.bound == AgcConstraint::Bound::Lower &&
+		    newGain > gain) {
+			LOG(AgcMeanLuminance, Debug)
+				<< "Apply lower bound: " << gain << " to "
+				<< newGain;
 			gain = newGain;
+		}
 
-		if (constraint.bound == AgcConstraint::Bound::upper &&
-		    newGain < gain)
+		if (constraint.bound == AgcConstraint::Bound::Upper &&
+		    newGain < gain) {
+			LOG(AgcMeanLuminance, Debug)
+				<< "Apply upper bound: " << gain << " to "
+				<< newGain;
 			gain = newGain;
-	}
+		}
+	};
+
+	std::vector<AgcConstraint> &constraints = constraintModes_[constraintModeIndex];
+	std::for_each(constraints.begin(), constraints.end(), applyConstraint);
+
+	std::for_each(additionalConstraints_.begin(), additionalConstraints_.end(), applyConstraint);
 
 	return gain;
+}
+
+/**
+ * \brief Get the currently effective y target
+ *
+ * This function returns the current y target including exposure compensation.
+ *
+ * \return The y target value
+ */
+double AgcMeanLuminance::effectiveYTarget() const
+{
+	double lux = lux_;
+	if (relativeLuminanceTarget_.size() > 1 && lux_ == 0) {
+		/*
+		 * Warn after a few frames if there is still no lux measurement
+		 * available. The number of 10 is chosen a bit arbitrarily. It
+		 * is big enough to skip the frames that get queued on start
+		 * (and therefore are expected to have no valid lux value) and
+		 * small enough to show up quickly.
+		 */
+		if (frameCount_ > 10 && luxWarningEnabled_) {
+			luxWarningEnabled_ = false;
+			LOG(AgcMeanLuminance, Warning)
+				<< "Missing lux value for luminance target "
+				   "calculation, default to "
+				<< kDefaultLuxLevel
+				<< ". Note that the Lux algorithm must be "
+				   "included before the Agc algorithm.";
+		}
+
+		lux = kDefaultLuxLevel;
+	}
+
+	double luminanceTarget = relativeLuminanceTarget_.eval(
+		relativeLuminanceTarget_.domain().clamp(lux));
+
+	return std::min(luminanceTarget * exposureCompensation_,
+			kMaxRelativeLuminanceTarget);
 }
 
 /**
@@ -513,7 +653,8 @@ utils::Duration AgcMeanLuminance::filterExposure(utils::Duration exposureValue)
 }
 
 /**
- * \brief Calculate the new exposure value and splut it between shutter time and gain
+ * \brief Calculate the new exposure value and splut it between exposure time
+ * and gain
  * \param[in] constraintModeIndex The index of the current constraint mode
  * \param[in] exposureModeIndex The index of the current exposure mode
  * \param[in] yHist A Histogram from the ISP statistics to use in constraining
@@ -523,11 +664,12 @@ utils::Duration AgcMeanLuminance::filterExposure(utils::Duration exposureValue)
  *
  * Calculate a new exposure value to try to obtain the target. The calculated
  * exposure value is filtered to prevent rapid changes from frame to frame, and
- * divided into shutter time, analogue and digital gain.
+ * divided into exposure time, analogue, quantization and digital gain.
  *
- * \return Tuple of shutter time, analogue gain, and digital gain
+ * \return Tuple of exposure time, analogue gain, quantization gain and digital
+ * gain
  */
-std::tuple<utils::Duration, double, double>
+std::tuple<utils::Duration, double, double, double>
 AgcMeanLuminance::calculateNewEv(uint32_t constraintModeIndex,
 				 uint32_t exposureModeIndex,
 				 const Histogram &yHist,
@@ -539,6 +681,18 @@ AgcMeanLuminance::calculateNewEv(uint32_t constraintModeIndex,
 	 */
 	std::shared_ptr<ExposureModeHelper> exposureModeHelper =
 		exposureModeHelpers_.at(exposureModeIndex);
+
+	if (effectiveExposureValue == 0s) {
+		LOG(AgcMeanLuminance, Error)
+			<< "Effective exposure value is 0. This is a bug in AGC "
+			   "and must be fixed for proper operation.";
+		/*
+		 * Return an arbitrary exposure time > 0 to ensure regulation
+		 * doesn't get stuck with 0 in case the sensor driver allows a
+		 * min exposure of 0.
+		 */
+		return exposureModeHelper->splitExposure(10ms);
+	}
 
 	double gain = estimateInitialGain();
 	gain = constraintClampGain(constraintModeIndex, yHist, gain);

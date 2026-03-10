@@ -6,14 +6,15 @@
  */
 
 #include <algorithm>
+#include <cmath>
 #include <iomanip>
 #include <map>
-#include <math.h>
 #include <tuple>
 
 #include <linux/media-bus-format.h>
 #include <linux/version.h>
 
+#include <libcamera/base/flags.h>
 #include <libcamera/base/log.h>
 #include <libcamera/base/utils.h>
 
@@ -21,7 +22,8 @@
 #include <libcamera/control_ids.h>
 #include <libcamera/controls.h>
 #include <libcamera/formats.h>
-#include <libcamera/request.h>
+#include <libcamera/framebuffer.h>
+#include <libcamera/geometry.h>
 #include <libcamera/stream.h>
 
 #include <libcamera/ipa/ipa_interface.h>
@@ -36,6 +38,7 @@
 #include "libcamera/internal/ipa_manager.h"
 #include "libcamera/internal/media_device.h"
 #include "libcamera/internal/pipeline_handler.h"
+#include "libcamera/internal/request.h"
 #include "libcamera/internal/v4l2_subdevice.h"
 #include "libcamera/internal/v4l2_videodevice.h"
 
@@ -46,17 +49,17 @@ LOG_DEFINE_CATEGORY(VIMC)
 class VimcCameraData : public Camera::Private
 {
 public:
-	VimcCameraData(PipelineHandler *pipe, MediaDevice *media)
+	VimcCameraData(PipelineHandler *pipe, std::shared_ptr<MediaDevice> media)
 		: Camera::Private(pipe), media_(media)
 	{
 	}
 
 	int init();
 	int allocateMockIPABuffers();
-	void bufferReady(FrameBuffer *buffer);
-	void paramsBufferReady(unsigned int id, const Flags<ipa::vimc::TestFlag> flags);
+	void imageBufferReady(FrameBuffer *buffer);
+	void paramsComputed(unsigned int id, const Flags<ipa::vimc::TestFlag> flags);
 
-	MediaDevice *media_;
+	std::shared_ptr<MediaDevice> media_;
 	std::unique_ptr<CameraSensor> sensor_;
 	std::unique_ptr<V4L2Subdevice> debayer_;
 	std::unique_ptr<V4L2Subdevice> scaler_;
@@ -114,6 +117,9 @@ static const std::map<PixelFormat, uint32_t> pixelformats{
 	{ formats::BGR888, MEDIA_BUS_FMT_RGB888_1X24 },
 };
 
+static constexpr Size kMinSize{ 16, 16 };
+static constexpr Size kMaxSize{ 4096, 2160 };
+
 } /* namespace */
 
 VimcCameraConfiguration::VimcCameraConfiguration(VimcCameraData *data)
@@ -153,14 +159,20 @@ CameraConfiguration::Status VimcCameraConfiguration::validate()
 	const Size size = cfg.size;
 
 	/*
-	 * The scaler hardcodes a x3 scale-up ratio, and the sensor output size
-	 * is aligned to two pixels in both directions. The output width and
-	 * height thus have to be multiples of 6.
+	 * The sensor output size is aligned to two pixels in both directions.
+	 * Additionally, prior to v5.16, the scaler hardcodes a x3 scale-up
+	 * ratio, requiring the output width and height to be multiples of 6.
 	 */
-	cfg.size.width = std::max(48U, std::min(4096U, cfg.size.width));
-	cfg.size.height = std::max(48U, std::min(2160U, cfg.size.height));
-	cfg.size.width -= cfg.size.width % 6;
-	cfg.size.height -= cfg.size.height % 6;
+	Size minSize{ kMinSize };
+	unsigned int alignment = 2;
+
+	if (data_->media_->version() < KERNEL_VERSION(5, 16, 0)) {
+		minSize *= 3;
+		alignment *= 3;
+	}
+
+	cfg.size.expandTo(minSize).boundTo(kMaxSize)
+		.alignDownTo(alignment, alignment);
 
 	if (cfg.size != size) {
 		LOG(VIMC, Debug)
@@ -216,10 +228,12 @@ PipelineHandlerVimc::generateConfiguration(Camera *camera,
 			}
 		}
 
-		/* The scaler hardcodes a x3 scale-up ratio. */
-		std::vector<SizeRange> sizes{
-			SizeRange{ { 48, 48 }, { 4096, 2160 } }
-		};
+		/* Prior to v5.16, the scaler hardcodes a x3 scale-up ratio. */
+		Size minSize{ kMinSize };
+		if (data->media_->version() < KERNEL_VERSION(5, 16, 0))
+			minSize *= 3;
+
+		std::vector<SizeRange> sizes{ { minSize, kMaxSize } };
 		formats[pixelformat.first] = sizes;
 	}
 
@@ -242,10 +256,18 @@ int PipelineHandlerVimc::configure(Camera *camera, CameraConfiguration *config)
 	StreamConfiguration &cfg = config->at(0);
 	int ret;
 
-	/* The scaler hardcodes a x3 scale-up ratio. */
+	/*
+	 * Prior to v5.16, the scaler hardcodes a x3 scale-up ratio. For newer
+	 * kernels, use a sensor resolution of 1920x1080 and let the scaler
+	 * produce the requested stream size.
+	 */
+	Size sensorSize{ 1920, 1080 };
+	if (data->media_->version() < KERNEL_VERSION(5, 16, 0))
+		sensorSize = { cfg.size.width / 3, cfg.size.height / 3 };
+
 	V4L2SubdeviceFormat subformat = {};
 	subformat.code = MEDIA_BUS_FMT_SGRBG8_1X8;
-	subformat.size = { cfg.size.width / 3, cfg.size.height / 3 };
+	subformat.size = sensorSize;
 
 	ret = data->sensor_->setFormat(&subformat);
 	if (ret)
@@ -293,7 +315,7 @@ int PipelineHandlerVimc::configure(Camera *camera, CameraConfiguration *config)
 	 * vimc driver will fail pipeline validation.
 	 */
 	format.fourcc = V4L2PixelFormat(V4L2_PIX_FMT_SGRBG8);
-	format.size = { cfg.size.width / 3, cfg.size.height / 3 };
+	format.size = sensorSize;
 
 	ret = data->raw_->setFormat(&format);
 	if (ret)
@@ -341,8 +363,11 @@ int PipelineHandlerVimc::start(Camera *camera, [[maybe_unused]] const ControlLis
 	/* Map the mock IPA buffers to VIMC IPA to exercise IPC code paths. */
 	std::vector<IPABuffer> ipaBuffers;
 	for (auto [i, buffer] : utils::enumerate(data->mockIPABufs_)) {
+		Span<const FrameBuffer::Plane> planes = buffer->planes();
+
 		buffer->setCookie(i + 1);
-		ipaBuffers.emplace_back(buffer->cookie(), buffer->planes());
+		ipaBuffers.emplace_back(buffer->cookie(),
+					std::vector<FrameBuffer::Plane>{ planes.begin(), planes.end() });
 	}
 	data->ipa_->mapBuffers(ipaBuffers);
 
@@ -398,7 +423,7 @@ int PipelineHandlerVimc::processControls(VimcCameraData *data, Request *request)
 			continue;
 		}
 
-		int32_t value = lroundf(it.second.get<float>() * 128 + offset);
+		int32_t value = std::lround(it.second.get<float>() * 128 + offset);
 		controls.set(cid, std::clamp(value, 0, 255));
 	}
 
@@ -454,7 +479,7 @@ bool PipelineHandlerVimc::match(DeviceEnumerator *enumerator)
 	dm.add("RGB/YUV Input");
 	dm.add("Scaler");
 
-	MediaDevice *media = acquireMediaDevice(enumerator, dm);
+	std::shared_ptr<MediaDevice> media = acquireMediaDevice(enumerator, dm);
 	if (!media)
 		return false;
 
@@ -470,7 +495,7 @@ bool PipelineHandlerVimc::match(DeviceEnumerator *enumerator)
 		return false;
 	}
 
-	data->ipa_->paramsBufferReady.connect(data.get(), &VimcCameraData::paramsBufferReady);
+	data->ipa_->paramsComputed.connect(data.get(), &VimcCameraData::paramsComputed);
 
 	std::string conf = data->ipa_->configurationFile("vimc.conf");
 	Flags<ipa::vimc::TestFlag> inFlags = ipa::vimc::TestFlag::Flag2;
@@ -510,26 +535,25 @@ int VimcCameraData::init()
 		return ret;
 
 	/* Create and open the camera sensor, debayer, scaler and video device. */
-	sensor_ = std::make_unique<CameraSensor>(media_->getEntityByName("Sensor B"));
-	ret = sensor_->init();
-	if (ret)
-		return ret;
+	sensor_ = CameraSensorFactoryBase::create(media_->getEntityByName("Sensor B"));
+	if (!sensor_)
+		return -ENODEV;
 
-	debayer_ = V4L2Subdevice::fromEntityName(media_, "Debayer B");
+	debayer_ = V4L2Subdevice::fromEntityName(media_.get(), "Debayer B");
 	if (debayer_->open())
 		return -ENODEV;
 
-	scaler_ = V4L2Subdevice::fromEntityName(media_, "Scaler");
+	scaler_ = V4L2Subdevice::fromEntityName(media_.get(), "Scaler");
 	if (scaler_->open())
 		return -ENODEV;
 
-	video_ = V4L2VideoDevice::fromEntityName(media_, "RGB/YUV Capture");
+	video_ = V4L2VideoDevice::fromEntityName(media_.get(), "RGB/YUV Capture");
 	if (video_->open())
 		return -ENODEV;
 
-	video_->bufferReady.connect(this, &VimcCameraData::bufferReady);
+	video_->bufferReady.connect(this, &VimcCameraData::imageBufferReady);
 
-	raw_ = V4L2VideoDevice::fromEntityName(media_, "Raw Capture 1");
+	raw_ = V4L2VideoDevice::fromEntityName(media_.get(), "Raw Capture 1");
 	if (raw_->open())
 		return -ENODEV;
 
@@ -575,7 +599,7 @@ int VimcCameraData::init()
 	return 0;
 }
 
-void VimcCameraData::bufferReady(FrameBuffer *buffer)
+void VimcCameraData::imageBufferReady(FrameBuffer *buffer)
 {
 	PipelineHandlerVimc *pipe =
 		static_cast<PipelineHandlerVimc *>(this->pipe());
@@ -594,13 +618,13 @@ void VimcCameraData::bufferReady(FrameBuffer *buffer)
 	}
 
 	/* Record the sensor's timestamp in the request metadata. */
-	request->metadata().set(controls::SensorTimestamp,
-				buffer->metadata().timestamp);
+	request->_d()->metadata().set(controls::SensorTimestamp,
+				      buffer->metadata().timestamp);
 
 	pipe->completeBuffer(request, buffer);
 	pipe->completeRequest(request);
 
-	ipa_->fillParamsBuffer(request->sequence(), mockIPABufs_[0]->cookie());
+	ipa_->computeParams(request->sequence(), mockIPABufs_[0]->cookie());
 }
 
 int VimcCameraData::allocateMockIPABuffers()
@@ -618,8 +642,8 @@ int VimcCameraData::allocateMockIPABuffers()
 	return video_->exportBuffers(kBufCount, &mockIPABufs_);
 }
 
-void VimcCameraData::paramsBufferReady([[maybe_unused]] unsigned int id,
-				       [[maybe_unused]] const Flags<ipa::vimc::TestFlag> flags)
+void VimcCameraData::paramsComputed([[maybe_unused]] unsigned int id,
+				    [[maybe_unused]] const Flags<ipa::vimc::TestFlag> flags)
 {
 }
 

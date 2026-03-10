@@ -10,6 +10,7 @@
 #include <memory>
 #include <optional>
 #include <ostream>
+#include <stdint.h>
 #include <string>
 #include <vector>
 
@@ -17,6 +18,7 @@
 
 #include <libcamera/base/class.h>
 #include <libcamera/base/log.h>
+#include <libcamera/base/regex.h>
 
 #include <libcamera/color_space.h>
 #include <libcamera/geometry.h>
@@ -65,7 +67,7 @@ struct V4L2SubdeviceFormat {
 	Size size;
 	std::optional<ColorSpace> colorSpace;
 
-	const std::string toString() const;
+	std::string toString() const;
 };
 
 std::ostream &operator<<(std::ostream &out, const V4L2SubdeviceFormat &f);
@@ -162,6 +164,8 @@ public:
 
 	static std::unique_ptr<V4L2Subdevice>
 	fromEntityName(const MediaDevice *media, const std::string &entity);
+	static std::unique_ptr<V4L2Subdevice>
+	fromEntityName(const MediaDevice *media, const std::regex &entity);
 
 protected:
 	std::string logPrefix() const override;
@@ -175,6 +179,9 @@ private:
 	std::vector<unsigned int> enumPadCodes(const Stream &stream);
 	std::vector<SizeRange> enumPadSizes(const Stream &stream,
 					    unsigned int code);
+
+	int getRoutingLegacy(Routing *routing, Whence whence);
+	int setRoutingLegacy(Routing *routing, Whence whence);
 
 	const MediaEntity *entity_;
 
